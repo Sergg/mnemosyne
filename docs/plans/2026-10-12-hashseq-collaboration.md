@@ -303,6 +303,193 @@ code at ea282b1, reviewed and accepted.
 - **Tests**: the sync engine between two in-process apps through `httpx.ASGITransport` (no iroh);
   the sidecar's dial/pair in Rust like link/tests/tunnel.rs.
 
+## Phase 4: tasks and decisions as objects
+
+### Phase 4 design (agreed with Corey 2026-10-21)
+
+Status: built 2026-10-21, unreleased, as designed below. Found while building: linking only ever
+reaches OLDER meetings (else a done item with a newer open twin got linked and reopened, against
+the rule; also re-summarizing an old meeting could link it forward); decisions with the same
+wording read "also decided in", only different wording "supersedes"; LLM hints never offer tasks
+from local-only meetings to a cloud provider; the linking settings sit in the Obsidian section of
+Settings, next to the other task setting.
+
+Drafted against the code at ae5c293, reviewed and accepted.
+
+- **The link lives on the item; objects are derived.** `ActionItem.task_id` (12 hex, "" = not
+  linked; minted on any machine). A task object = every action item (across meetings) with the
+  same `task_id`; an unlinked item is its own object (key `<session_id>:<item id>`). No new table,
+  nothing new travels in library sync (items travel inside summary_data; `task_id` joins
+  sync_merge's ITEM_SCALARS); phase 2's `_project` copies items whole, so the link survives
+  re-summarize, revise and restore. Decisions: `SummaryData.decision_links: {decision id: object
+  id}` (pruned when the decision is gone).
+- **Object state**: head = the mention in the newest meeting the caller can see. text, owner,
+  due, at = the head's (editing a task edits its head mention). done, follow, issue_url are the
+  object's: every write fans out to all mentions (each bumps its meeting, so it syncs); a
+  reconcile (head wins) after sync merges and at startup repairs mentions that disagree. Team
+  mode: a tick fans out into linked meetings the ticker cannot see (same task; the history names
+  the ticker); lists show only visible mentions.
+- **Linking** (services/task_links.py): candidates are OPEN objects of other visible meetings,
+  owner-compatible, each used once. Exact normalized text always; close text (`same_item`,
+  >= 20 characters) only when the earlier meeting is related (recurring title or same people)
+  (Corey: exact + related, setting `task_linking`). Run at summarize (after the merge) and after
+  hand edits / restore / Obsidian pull-back (exact only). A done task that comes up again is a NEW
+  open task (Corey); a manual link makes the head's state the object's and fans it out. Manual
+  link/unlink routes; "Suggested links" for close matches on existing data. Every link is a
+  `task_linked` history line. Decisions: exact text only; "supersedes" is a manual link (the head
+  is the current wording, earlier mentions what it superseded).
+- **Optional LLM-assisted linking** (Corey: build it, off by default; never with the built-in
+  local model): the summary prompt lists related meetings' open tasks by id and may mark an item
+  `"continues": "<id>"`; only offered ids are accepted.
+- **Obsidian** (Corey: one checkbox per task): only the head mention's note has the checkbox;
+  earlier mentions render as plain bullets `↩ continued in [[later note]]` (keeping their `^m-`
+  block id), so vault-wide task queries list each task once. A tick in the note fans out.
+- **Consumers**: Tasks view rows are objects with an "in N meetings" history, link/unlink,
+  suggestions; SummaryView shows "↩ continues from" and "supersedes / superseded by"; brief,
+  people, organizations, MCP collapse by object; decisions log shows superseded chains;
+  GitHub/Linear/Jira issue links fan out. HubSpot keeps one task per mention (later).
+- **Migration** (once at startup): exact links over existing meetings, then reconcile (head wins,
+  fanned out); close matches appear only as suggestions.
+
+## Phase 5: comments and threads
+
+### Phase 5 design (agreed with Corey 2026-10-21)
+
+Status: built 2026-10-21, unreleased, as designed below. Found while building: a moment comment is
+never detached (a time in the audio is always valid; it shows on a line within 5 s or "at m:ss");
+summary-text anchors match the rendered text (markdown stripped on both sides); comments on other
+meetings' threads shown in Tasks act on their own meeting.
+
+Drafted against the code at 494741b, reviewed and accepted.
+
+- **No hashseq marks yet.** Transcript lines have no stable id (segments are keyed by meeting and
+  index; re-transcription replaces them) and summary docs are local and disposable (they never
+  travel). Marks need a per-meeting store that syncs; revisit with live shared notes.
+- **Anchors** (`comments` table: id 12 hex, session_id, parent_id ('' = root), target
+  segment/body/decision/question/item, target_id, anchor JSON, quote, text, author_id, author,
+  created/updated, resolved_at/by, deleted): transcript comments are a time span `(part, start,
+  end)` like bookmarks and live flags, re-anchored at read time to the line with the largest
+  overlap (follows edits, splits, merges, re-transcription; a zero-length span is a comment on a
+  moment of the audio from the player, Corey: include it); decision/question/item comments by
+  block id (survives rewording); summary-text comments by a text-quote selector (exact, prefix,
+  suffix; fuzzy fallback). A comment whose text changed is flagged; one whose anchor is gone is
+  "detached", shown with its quote in a Comments card, never deleted automatically.
+- **Tasks**: a comment attaches to one mention (session + item id) and is aggregated on the task
+  object (visible mentions only); posting from the Tasks view goes to the head mention.
+  Decisions likewise.
+- **Sync**: comments travel inside their meeting (`SyncSession.comments`), merged by id three-way
+  (added/removed/edited; text through the merge, resolved/deleted as scalars).
+- **Team mode**: anyone who can read the meeting comments; authors edit their own; delete:
+  author, meeting owner or admin; resolve/reopen: meeting owner, admin or the thread's author.
+  Desktop author = `local_speaker_name`, shown as "You". History lines `commented`,
+  `comment_resolved`, `comment_reopened`.
+- **Scope** (Corey): not exported to Obsidian in v1 (the pull-back would read them as annex lines);
+  keyword search yes, Ask and summaries no; @mentions on a team server notify the mentioned person
+  online (toast + desktop notification), no email or digest. Open comments listed in MCP.
+
+## Phase 6: live shared notes
+
+### Phase 6 design (agreed with Corey 2026-10-22)
+
+Status: built 2026-10-22, unreleased, as designed below (notes-core and notes-wasm crates, the `notes`
+CI job, relay and sync in the backend, the editor in src/lib/notes, Vitest and Playwright specs).
+Found while building:
+
+- Mark strings over 14 bytes (URLs, every `comment:<id>`) are artifacts: hashseq keeps them out of
+  the delta, so they travel as 0xAF frames, drained before the delta, resent on every reconnect
+  (duplicates are harmless), and the relay logs and forwards them like deltas.
+- Enter at a line end puts the new `\n` AFTER the old terminator, so the line keeps its kind
+  and mark affinity and the new line gets the continued kind; Enter mid-line puts the new
+  terminator at the caret and the old one moves to the end.
+- Inline anchors must equal wasm's `markRange` (`Before(first)..Before(next)`, `After(last)` at the
+  document end), so bold/italic/strike grow at their end only; code, link and comments use
+  `markRangeClosed`; the Rust side (notes-core) builds the same anchors.
+- Reconnect: the hello's snapshot and backlog go into a throwaway replica whose frontier is what the
+  server holds; they are merged into the live store without sending, then `applyFrontier` with that
+  frontier makes the next drain exactly what the server lacks (offline edits included).
+- Text written around the document (the notes route, library sync's text merge, a meeting with no
+  sidecar for a while) is caught up into it as an `api` edit before a join or fold, else the next
+  fold would render over it.
+- A union that fails (sidecar missing) holds the sync cursor just before that meeting and the round
+  goes on to the other meetings, which are not blocked; it is tried again next round.
+- Comments on notes are marked by the SERVER from the element ids (`notes_ids`), not by the client,
+  so a read-only reader (a reviewer) can comment.
+- The join/fold race (a fold between reading the snapshot and reading the frames): join reads the snapshot and the frames after it together (and enters the room in
+  the same step), so a frame is in the backlog or relayed, never neither or both.
+
+Drafted against the code at 273eaf3 (hashseq 94f5e3c), reviewed and accepted.
+
+- **The CRDT runs in every client** (the desktop webview and the team server's web app) as
+  hashseq's wasm build: one `WasmHashWeb` per meeting, the notes are one seq whose origin is
+  `sha256("mnemosyne/notes/" + session_id)`, computed in Python and sent in hello, so every client
+  and machine opens the same object with no create race. The client fixes QUEUE 39 itself: drain
+  `takeDeltas()` before applying a remote frame, then `applyFrontier(encodeFrontier())`.
+- **The backend is an opaque relay** (it cannot decode hashseq): `/ws/notes/{session_id}` (binary
+  0xDE frames plus JSON text frames; auth like `/ws`, `Hidden` closes 4404). Per meeting:
+  `shared_notes_ops(session_id, seq, frame, author_id, author, at, folded)` and
+  `shared_notes(session_id, snapshot, folded_seq, updated_at)`, both in SQLCipher, cascading on
+  delete. Join = folded snapshot, unfolded frames in order, then a JSON hello (objects, you,
+  present, last edit, `read_only`). A client frame is checked (tag, ≤ 256 KB), appended, relayed to
+  the others (never echoed). Presence (`typing`) is relayed JSON. Authorship is recorded per frame
+  from the connection (team user, desktop `local_speaker_name`, "api", "sync (<machine>)").
+- **Folding** by the stateless sidecar (`mnemosyne-link notes doc fold|set_text|merge`): 2 s after
+  the last frame, every 30 s while active, on last leave, before summarize/export/sync serve. It
+  writes the snapshot and the projection, **`Session.notes` = the rendered markdown**, through
+  `update_fields` (`_touch`, FTS), with a bus event. Search, Obsidian, MCP, combine and the summary
+  keep reading `Session.notes`. No sidecar: hello says `unavailable` and the old textarea is used.
+- **Document model: one flat seq, structure in marks** (not kb.js's page kv + block seqs: nested
+  objects, comments cannot span blocks, ~4k lines of DOM to vendor). The text is lines ending in
+  `\n` (the doc always ends with one). A line's kind is a closed `block` mark on its terminating
+  `\n`: `h1|h2|h3|bullet|number|task|task_done|quote|code|table|table_head` (`lang` on a fence's
+  first line). Inline: `bold`, `italic`, `strike` grow at their end (wasm `markRange` anchors:
+  `Before(start)..Before(next)`), `code` and `link` (value = URL) closed (`markRangeClosed`),
+  `comment:<id>` closed; flag values are `"true"`. Concurrent line kinds stay live together:
+  `task`+`task_done` resolve to done, otherwise the first in `markedSpans` order; two live link
+  URLs render as plain text with "(link conflict)". Mark strings over 14 bytes (URLs, comment
+  kinds) travel as 0xAF artifact frames, which the relay forwards and logs like 0xDE deltas.
+- **Tables** (Corey: in v1): rows are lines of kind `table` (the first row of a run
+  `table_head`), cells separated by U+001F in the text, inline marks allowed in cells. Column
+  alignment is an `align` mark on the head row's terminator, one of `l c r -` per column (`"lc-r"`). Adding a column inserts a separator
+  in every row; ragged rows (concurrent column edits) are padded by the renderer and the editor.
+  Tab / Shift+Tab move between cells, Tab in the last cell adds a row.
+- **Markdown both ways, one implementation**: a `notes-core` Rust crate (hashseq + render +
+  parse + `set_text`) used by the sidecar AND compiled into the wasm module, so the client's
+  markdown paste and the server's fold agree. Render is canonical (fixed nesting: link, bold,
+  italic, strike, code; escapes only where needed; GFM tables with `\|`). The parser covers the
+  rendered subset plus `__`/`_`/`*` variants; anything else (HTML, images) stays literal text,
+  normalised once. `set_text(md)` diffs the plain text by lines then words (notes.rs's diff, moved
+  into notes-core) and reconciles marks, emitting nothing for an unchanged doc
+  (property-tested: `set_text(render(doc))` is empty, `render(parse(md))` is a fixpoint).
+- **Seeding and other writers**: a meeting with notes and no doc is seeded by `set_text`, only on
+  its origin machine. The old `POST /sessions/{id}/notes` (API, MCP) goes through `set_text` as
+  author "api" and is broadcast.
+- **Library sync**: `SyncSession.notes_doc` (canonical snapshot, folded at serve). Both sides
+  with a doc: union merge (no base needed). One side only: today's three-way text merge, then
+  `set_text` into the doc. Offline edits are just ops; the union merges them later.
+- **Editor: our own contenteditable** (`src/lib/notes/`, Svelte 5), porting by name (MIT,
+  attributed) kb.js's proven primitives: text extraction with fillers and sentinel, DOM point ↔
+  code-point offset, diff at the caret, mark affinity at boundaries, selection kept by element id
+  (`seqIdAt`/`seqPositionOf`), composition deferral, input rules. One line element per line,
+  re-rendered only when that line changed, so remote edits never move the caret. Plain typing is
+  native and committed by diff; Enter, Backspace at a line start, formatting shortcuts
+  (Ctrl+B/I/E/K, Ctrl+Shift+X), cut, paste and undo are `beforeinput` commands. Input rules: `# `,
+  `- `, `1. `, `> `, `[ ] `, a fence, `|a|b|` + Enter → table. **Paste** (Corey: markdown too):
+  text/plain is parsed as markdown by notes-core in wasm and inserted with its marks; copy puts
+  the selection's markdown on the clipboard. Undo is local (inverse ops of your own edits).
+  WebKitGTK (the desktop) is tested from the first DOM task, and the e2e runs in WebKit too.
+- **Access**: owner, admin and shared-with (incl. "*") edit; reviewers on others' meetings read.
+- **Copilot** (Corey): the panel stays; each line gets "Add to notes", an ordinary insert.
+- **Summary**: a `shared_notes_hint` from `Session.notes` ("notes the attendees took; the
+  transcript wins", 12k budget). Old meetings with hand notes get them on their next re-summary.
+- **Comments on notes**: `comment:<id>` marks; the thread stays in the phase 5 table (target
+  `notes`); the fold reports each comment's range, a fully deleted range = detached.
+- **Not in v1**: the phone page; per-character author colours (the per-frame data is kept);
+  rich HTML paste; images and math. Typed notes are permanent in the op history (no redaction
+  once synced; prerequisite 1 still holds).
+- **Tests**: Vitest + jsdom for the pure editor parts (Corey: yes), `cargo test` for notes-core,
+  TestClient websockets for the relay, two-app sync tests, a Playwright two-page convergence spec
+  in Chromium and WebKit (the e2e job builds link).
+
 ## Later, each behind the prerequisites below
 
 - **Live shared notes** during a meeting: a scratchpad attendees type into (desktop, or the team
@@ -337,14 +524,27 @@ code at ea282b1, reviewed and accepted.
 4. **Format stability.** Stores we persist must decode after a hashseq upgrade; pin the crate
    by commit and keep its grammar test vectors in our CI.
 
-## Questions for David
+## Questions for David (answered 2026-10-13)
 
-- Are signatures or authorship planned in the core or for an app layer?
-- Private (encrypted) spaces?
-- An app-conventions crate (APP_NOTES.md 5: the wrappers every app rewrites)?
-- Is the canonical encoding stable enough to persist user data now?
-- Is the Basecamp module headed for the official Logos set, and over which delivery topics?
-- Which way is QUEUE.md 56 going?
+- **Signatures or authorship in the core?** No. The plan is an authorship layer on top:
+  signatures in a side table referencing the op ids they sign. Authorship in the core would
+  break what the core is for: permissionless, no overhead between 1 editor and 1M; signatures
+  mean tracking identities, so space grows with the number of editors. → Prerequisite 2 stays
+  ours, as sketched: a signature table keyed by op id.
+- **Private (encrypted) spaces?** Not in the core either: the core is like JSON; encryption is
+  a layer on top and the app picks how. → Prerequisite 1 stays ours.
+- **An app-conventions crate?** Would be good, but he is holding off doing it too early. → Keep
+  our own thin wrappers; do not wait for it.
+- **Canonical encoding stable enough to persist user data?** Yes, stable now. → Prerequisite 4
+  is met; keep pinning the crate by rev.
+- **Basecamp module official, over which topics?** Only in his personal registry: the company
+  has no bandwidth to support it officially (a very large app; fine to be vibed on a personal
+  registry, higher stakes if official). → Publishing through it would depend on an unofficial
+  module; treat Logos publishing as exploratory.
+- **QUEUE.md 56?** Undecided, needs exploration. A shared op space would let objects move between
+  containers (e.g. elements of a parent seq moved into a child seq in a nested tree); a sharded op
+  space allows some simplifications. → Prerequisite 3 stays open; our designs avoid nested
+  objects (phase 2's per-block histories are independent seqs).
 
 ## Out of scope
 

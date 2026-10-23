@@ -16,6 +16,16 @@ class SegmentHit(ApiModel):
     semantic: bool = False  # found by meaning, not by the words typed
 
 
+class CommentHit(ApiModel):
+    id: str
+    author: str
+    target: str  # segment / body / decision / question / item / notes, '' = the meeting
+    label: str  # what it is on, readable: "Transcript", "Summary", "Notes"... ('' = the meeting)
+    quote: str  # the text it was written about, whole
+    target_id: str
+    snippet: str  # matches wrapped in [[ ]]
+
+
 class SearchHit(ApiModel):
     session_id: str
     session_name: str
@@ -23,4 +33,5 @@ class SearchHit(ApiModel):
     score: float
     session_snippet: str | None = None  # match in name/summary/notes
     segments: list[SegmentHit] = Field(default_factory=list)
+    comments: list[CommentHit] = Field(default_factory=list)  # kind "comment" hits
     match: Literal["keyword", "semantic", "both"] = "keyword"

@@ -185,7 +185,34 @@ async def get_meeting(
         out += [f"[{_mmss(x['start'])}] {x['speaker']}: {x['text']}" for x in page]
         if offset + len(page) < len(lines):
             out.append(f"... more: call again with offset={offset + len(page)}")
+    open_threads = await _open_comments(backend, session_id)
+    if open_threads:
+        out += ["", "## Open comments"] + open_threads
     return "\n".join(out)
+
+
+async def _open_comments(backend: Backend, session_id: str) -> list[str]:
+    """Open threads (root neither resolved nor deleted) as lines, a reply indented under its
+    root. Nothing when the comments cannot be read: the meeting is still worth reading."""
+    try:
+        data = await backend.get(f"/api/sessions/{session_id}/comments")
+    except Exception:
+        return []
+    lines: list[str] = []
+    for thread in data.get("threads") or []:
+        root = thread["root"]
+        if root.get("resolved_at") or root.get("deleted"):
+            continue
+        quote = (root.get("quote") or "").strip()
+        if len(quote) > 60:
+            quote = quote[:59] + "…"
+        label = "Notes: " if root.get("target") == "notes" else ""
+        on = f" (on {label}“{quote}”)" if quote else (" (on the notes)" if label else "")
+        lines.append(f"- {root.get('author') or 'unknown'}: {root['text']}{on}")
+        for reply in thread.get("replies") or []:
+            if not reply.get("deleted"):
+                lines.append(f"  - {reply.get('author') or 'unknown'}: {reply['text']}")
+    return lines
 
 
 async def get_action_items(backend: Backend, days: int = 14) -> str:
@@ -197,18 +224,38 @@ async def get_action_items(backend: Backend, days: int = 14) -> str:
         and not s.get("local_only")
         and datetime.fromisoformat(s["created_at"]) >= cutoff
     ]
+    details = [(s, await backend.get(f"/api/sessions/{s['id']}")) for s in sessions]
+    details.sort(key=lambda sd: sd[0]["created_at"], reverse=True)  # newest first
+    # A task linked across meetings is listed once, under its newest meeting, as that says.
+    seen_in: dict[str, int] = {}
+    for _, detail in details:
+        for a in (detail.get("summary_data") or {}).get("action_items") or []:
+            if a.get("task_id"):
+                seen_in[a["task_id"]] = seen_in.get(a["task_id"], 0) + 1
+    listed: set[str] = set()
     out = []
-    for s in sessions:
-        detail = await backend.get(f"/api/sessions/{s['id']}")
-        items = (detail.get("summary_data") or {}).get("action_items") or []
-        if items:
-            out.append(f"## {s['name']} ({_date(s['created_at'])}) id={s['id']}")
-            out += [
+    for s, detail in details:
+        lines = []
+        for a in (detail.get("summary_data") or {}).get("action_items") or []:
+            tid = a.get("task_id")
+            if tid:
+                if tid in listed:
+                    continue
+                listed.add(tid)
+            more = (
+                f" (also in {seen_in[tid] - 1} earlier meeting{'s' if seen_in[tid] > 2 else ''})"
+                if tid and seen_in[tid] > 1
+                else ""
+            )
+            lines.append(
                 ("- [x] " if a.get("done") else "- [ ] ")
                 + a["text"]
                 + (f" ({a['owner']})" if a.get("owner") else "")
-                for a in items
-            ]
+                + more
+            )
+        if lines:
+            out.append(f"## {s['name']} ({_date(s['created_at'])}) id={s['id']}")
+            out += lines
     return "\n".join(out) if out else f"No action items in the last {days} days."
 
 

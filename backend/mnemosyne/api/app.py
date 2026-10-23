@@ -9,6 +9,7 @@ from ..config import Settings, load_settings
 from .app_watch import outlives_app, watch_app
 from .auth import LockedMiddleware, TokenAuthMiddleware
 from .context import AppContext
+from .notes_ws import router as notes_ws_router
 from .routes.ask import router as ask_router
 from .routes.assets import router as assets_router
 from .routes.audio import router as audio_router
@@ -16,6 +17,7 @@ from .routes.backup import router as backup_router
 from .routes.bookmarks import router as bookmarks_router
 from .routes.calendar import router as calendar_router
 from .routes.clips import router as clips_router
+from .routes.comments import router as comments_router
 from .routes.devices import router as devices_router
 from .routes.digests import router as digests_router
 from .routes.encryption import router as encryption_router
@@ -64,7 +66,7 @@ def create_app(settings: Settings | None = None, keystore=None) -> FastAPI:
             watching[1].cancel()
         await ctx.shutdown()
 
-    app = FastAPI(title="Mnemosyne Backend", version="0.18.0", lifespan=lifespan)
+    app = FastAPI(title="Mnemosyne Backend", version="0.21.0", lifespan=lifespan)
     app.state.ctx = ctx
     app.add_middleware(
         CORSMiddleware,
@@ -100,6 +102,7 @@ def create_app(settings: Settings | None = None, keystore=None) -> FastAPI:
     app.include_router(speakers_router)
     app.include_router(segments_router)
     app.include_router(bookmarks_router)
+    app.include_router(comments_router)
     app.include_router(live_flags_router)
     app.include_router(assets_router)
     app.include_router(external_notes_router)
@@ -121,6 +124,7 @@ def create_app(settings: Settings | None = None, keystore=None) -> FastAPI:
     app.include_router(calendar_router)
     app.include_router(integrations_router)
     app.include_router(ws_router)
+    app.include_router(notes_ws_router)
 
     @app.get("/health")
     async def health():

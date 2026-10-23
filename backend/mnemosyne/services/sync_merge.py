@@ -4,19 +4,24 @@ docs/plans/2026-10-12-hashseq-collaboration.md, bullet "Merge").
 `merge` is pure: no database, no clock but `updated_at` of the result. The caller has already
 decided the two versions are concurrent (`vv_relation`) and found the base: our state the peer
 last incorporated. Texts (the summary body, the notes, every decision, open question and action
-item by id, bookmark notes) go through the sidecar's one-off three-way form (`base`), all of a
-meeting in one `merge_many` run; everything else is rules in Python:
+item by id, bookmark notes, comment texts) go through the sidecar's one-off three-way form
+(`base`), all of a meeting in one `merge_many` run; everything else is rules in Python:
 
 - a scalar changed on one side takes that side, changed on both the side with the newer
   `updated_at` (listed in the report's `fields`);
 - sets (topics, participants, attendees) and rows by id (bookmarks, external notes, live flags,
-  asset links, speaker embeddings) merge present/absent three ways: added on one side → added,
-  removed on one side and untouched on the other → removed, removed vs changed → the change;
+  comments, asset links, speaker embeddings) merge present/absent three ways: added on one
+  side → added, removed on one side and untouched on the other → removed, removed vs changed →
+  the change;
 - summary items by id per section the same way, with Corey's rule that a touched item survives
   a deletion on the other side; the order is ours with theirs' additions placed by `place`;
 - chapters, client facts and the agenda are whole lists; agenda `covered` is OR'd per point;
 - the transcript is one unit: changed on one side → it, on both → the recording machine's;
-- history events are a union by uid; recordings rows are the origin's.
+- history events are a union by uid; recordings rows are the origin's;
+- the notes: when both sides have a live notes document and they differ, the documents are
+  merged by op-set union (services/sync_notes.py, run by the caller) and `notes` is not merged as
+  text here (it is ours until the caller sets the union's render); when only theirs has one the
+  text is merged as above and the adopted document catches up with it.
 
 Without a base (`base is None`) the side with the newer `updated_at` is taken whole.
 `apply` writes a merge through `summary_doc.apply_human` (the summary, so the local document
@@ -63,10 +68,19 @@ SUMMARY_SCALARS = (
     "edited_at",
     "edited_by",
 )
-ITEM_SCALARS = ("owner", "due", "at", "live", "done", "follow", "issue_url")
+ITEM_SCALARS = ("owner", "due", "at", "live", "done", "follow", "issue_url", "task_id")
 
 
 # ---- version vectors ------------------------------------------------------------------------
+
+
+def both_docs(ours: SyncSession, theirs: SyncSession) -> bool:
+    """Both sides have a notes document and the documents differ: their union is the merge."""
+    return (
+        ours.notes_doc is not None
+        and theirs.notes_doc is not None
+        and ours.notes_doc != theirs.notes_doc
+    )
 
 
 def vv_relation(ours: dict[str, int], theirs: dict[str, int]) -> str:
@@ -406,6 +420,10 @@ def merge(
         report.update(replaced=True, taken=side, transcript=side)
         if side == "theirs":
             report["kept"] += 1
+        elif theirs.notes_doc is not None and ours.notes_doc is None:
+            # Their document is adopted: our text edits cannot be merged without a base, and
+            # catching the document up with them would delete what only the document has.
+            out.notes = theirs.notes
         _finish(out, ours, theirs, vv, now, ours_is_origin)
         return out, report
 
@@ -417,7 +435,8 @@ def merge(
             name,
             m.scalar(getattr(base, name), getattr(ours, name), getattr(theirs, name), name),
         )
-    out.notes = m.text(base.notes, ours.notes, theirs.notes, "notes", out, "notes")
+    if not both_docs(ours, theirs):  # else the caller sets the union's render
+        out.notes = m.text(base.notes, ours.notes, theirs.notes, "notes", out, "notes")
     out.participants = _set_merge(base.participants, ours.participants, theirs.participants)
     out.attendees = _set_merge(base.attendees, ours.attendees, theirs.attendees)
     for field in ("participants", "attendees"):
@@ -450,6 +469,11 @@ def merge(
             _rows(base.live_flags), _rows(ours.live_flags), _rows(theirs.live_flags), "live flag"
         ).values()
     )
+    out.comments = list(
+        m.by_id(
+            _rows(base.comments), _rows(ours.comments), _rows(theirs.comments), "comment", "text"
+        ).values()
+    )
     out.assets = list(
         m.by_id(_rows(base.assets), _rows(ours.assets), _rows(theirs.assets), "asset").values()
     )
@@ -476,7 +500,10 @@ def merge(
         m.report["both"] += 1
         m.report["fields"].append(f"transcript: {'ours' if ours_is_origin else 'theirs'} (origin)")
 
-    m.run_texts()  # one sidecar run: the body, notes, items and bookmark notes together
+    m.run_texts()  # one sidecar run: body, notes, items, bookmark notes and comments together
+    for c in out.comments:
+        if c.deleted:  # deleted on one side, edited on the other: the deletion empties it
+            c.text, c.mentions = "", []
     if item_texts is not None:
         _set_item_texts(out.summary_data, item_texts)
     _finish(out, ours, theirs, vv, now, ours_is_origin)
@@ -494,6 +521,7 @@ def _finish(
     """What every merge shares: ids and `created_at` are ours, events are a union, the
     recordings rows and the origin's audio path are the recording machine's."""
     out.id, out.created_at, out.origin = ours.id, ours.created_at, ours.origin
+    out.notes_doc = None  # documents are merged apart from the rest (services/sync_notes.py)
     out.vv, out.updated_at = vv, now
     seen = {e.uid for e in ours.events}
     out.events = [e.model_copy() for e in ours.events] + [
@@ -574,6 +602,13 @@ def _merge_summary(m: _Merge, out: SyncSession) -> dict[str, dict[str, str]] | N
             ats = [values[i]["at"] for i in order]
             if sec == "decisions":
                 data.decision_ids, data.decision_at = list(order), ats
+                links = m.by_id(
+                    dict(b.decision_links),
+                    dict(o.decision_links),
+                    dict(t.decision_links),
+                    "decision link",
+                )
+                data.decision_links = {k: v for k, v in links.items() if k in set(order)}
             else:
                 data.question_ids, data.question_at = list(order), ats
     out.summary_data = data

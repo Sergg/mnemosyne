@@ -44,6 +44,27 @@ class SyncBookmark(ApiModel):
     created_at: datetime
 
 
+class SyncComment(ApiModel):
+    """A comment as stored (models/comment.py). Timestamps stay the stored ISO text; the
+    computed read fields (`changed`, `detached`, ...) are not part of it."""
+
+    id: str
+    parent_id: str = ""
+    target: str = ""
+    target_id: str = ""
+    anchor: dict = Field(default_factory=dict)
+    quote: str = ""
+    text: str = ""
+    author_id: str = ""
+    author: str = ""
+    mentions: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+    resolved_at: str | None = None
+    resolved_by: str = ""
+    deleted: bool = False
+
+
 class SyncAsset(ApiModel):
     """An asset a meeting uses. Links and the text read from files travel; file bytes never do
     (`filename` and `size` only say what the file is). `added_at`: when it was attached to
@@ -79,6 +100,10 @@ class SyncSession(ApiModel):
     summary: str = ""
     summary_data: SummaryData | None = None
     notes: str = ""
+    # The live shared notes document (services/shared_notes.py): base64 of the canonical
+    # snapshot, folded when served; None when the meeting has none (or the sidecar is missing
+    # there). Merged by op-set union (services/sync_notes.py), never three-way.
+    notes_doc: str | None = None
     participants: list[str] = Field(default_factory=list)
     attendees: list[str] = Field(default_factory=list)
     local_only: bool = False
@@ -94,6 +119,7 @@ class SyncSession(ApiModel):
     bookmarks: list[SyncBookmark] = Field(default_factory=list)
     external_notes: list[ExternalNotes] = Field(default_factory=list)
     live_flags: list[LiveFlag] = Field(default_factory=list)
+    comments: list[SyncComment] = Field(default_factory=list)  # absent from older peers
     speaker_embeddings: dict[str, list[float]] = Field(default_factory=dict)
     assets: list[SyncAsset] = Field(default_factory=list)
     events: list[SyncEvent] = Field(default_factory=list)

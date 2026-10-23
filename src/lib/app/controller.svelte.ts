@@ -20,6 +20,7 @@ import { askState } from '$lib/stores/ask.svelte.js';
 import { digestState } from '$lib/stores/digest.svelte.js';
 import { audioState } from '$lib/stores/audio.svelte.js';
 import { autoRecordState, type AutoMode } from '$lib/stores/autorecord.svelte.js';
+import { commentsState } from '$lib/stores/comments.svelte.js';
 import { calendarState } from '$lib/stores/calendar.svelte.js';
 import { connectionState, SAME_ORIGIN } from '$lib/stores/connection.svelte.js';
 import { jobsState } from '$lib/stores/jobs.svelte.js';
@@ -223,6 +224,14 @@ export async function exportActive() {
 }
 
 sessionState.onError = (message) => toastState.error(message);
+// Comments follow the open meeting.
+$effect.root(() => {
+  $effect(() => {
+    const id = sessionState.activeSession?.id ?? null;
+    if (id === commentsState.sessionId) return;
+    void commentsState.load(id);
+  });
+});
 transcriptState.isRecordingLive = () =>
   audioState.isRecording && audioState.activeSessionId === transcriptState.liveSessionId;
 
@@ -509,6 +518,8 @@ export function runLaunchActionOnce() {
 // ---- keyboard ------------------------------------------------------------------
 
 export function handleKeydown(e: KeyboardEvent) {
+  // A field that used the key itself (the notes editor: Ctrl+B bold, Ctrl+K link, Ctrl+E code).
+  if (e.defaultPrevented) return;
   // The palette opens from anywhere, text fields included.
   if (e.ctrlKey && e.key === 'k') {
     e.preventDefault();
@@ -644,12 +655,28 @@ function onConnected(): () => void {
       announceMention(msg.keyword, msg.speaker, msg.text);
       return;
     }
+    if (msg.type === 'comments') {
+      if (commentsState.sessionId === msg.session_id) void commentsState.load(msg.session_id);
+      const me = connectionState.me?.id;
+      if (me && msg.mentions.includes(me)) {
+        const name = sessionState.sessions.find((x) => x.id === msg.session_id)?.name || 'a meeting';
+        const text = `You were mentioned in a comment on ${name}`;
+        toastState.show(text, 'info', 10_000);
+        notifyDesktop('Mnemosyne', text);
+      }
+      return;
+    }
     if (msg.type === 'capture_health') {
       announceCaptureHealth(msg);
       return;
     }
-    if (msg.type === 'bookmarks' || msg.type === 'assets') {
+    if (msg.type === 'bookmarks' || msg.type === 'assets' || msg.type === 'notes') {
+      // 'notes': the live notes were folded into Session.notes (search, the plain-text editor);
+      // where a notes comment is now ("changed", "detached") comes from that fold.
       if (sessionState.activeSession?.id === msg.session_id) sessionState.refreshActive();
+      if (msg.type === 'notes' && commentsState.sessionId === msg.session_id) {
+        void commentsState.load(msg.session_id);
+      }
       return;
     }
     if (msg.type === 'hello') {

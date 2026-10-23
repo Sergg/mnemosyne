@@ -7,6 +7,7 @@ elsewhere: this module only reads and writes.
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime
 
@@ -21,6 +22,7 @@ from ..models.session import (
 from ..models.sync_session import (
     SyncAsset,
     SyncBookmark,
+    SyncComment,
     SyncEvent,
     SyncSession,
     event_travels,
@@ -40,6 +42,7 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
     if rows is None:
         return None
     r = rows["session"]
+    notes_doc = repo.notes_doc(session_id)
     return SyncSession(
         id=r["id"],
         created_at=r["created_at"],
@@ -50,6 +53,11 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
             SummaryData.model_validate_json(r["summary_data"]) if r["summary_data"] else None
         ),
         notes=r["notes"],
+        notes_doc=(
+            base64.b64encode(notes_doc["snapshot"]).decode("ascii")
+            if notes_doc and notes_doc["snapshot"] is not None
+            else None
+        ),
         participants=json.loads(r["participants"]),
         attendees=json.loads(r["attendees"]),
         local_only=bool(r["local_only"]),
@@ -116,6 +124,9 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
             )
             for x in rows["live_flags"]
         ],
+        comments=[
+            SyncComment(**{k: x[k] for k in SyncComment.model_fields}) for x in rows["comments"]
+        ],
         speaker_embeddings={x["label"]: json.loads(x["embedding"]) for x in rows["embeddings"]},
         assets=[
             SyncAsset(
@@ -146,6 +157,13 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
         origin=r["origin"] or device_id,
         vv=json.loads(r["sync_vv"] or "{}"),
     )
+
+
+def base_json(doc: SyncSession) -> str:
+    """The document as kept for a peer's later merge (`sync_served`): without the notes
+    document, which is merged by union and needs no base (the notes text stays for the
+    three-way merge)."""
+    return doc.model_copy(update={"notes_doc": None}).model_dump_json()
 
 
 def write_session(

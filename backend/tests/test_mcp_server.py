@@ -1,6 +1,7 @@
 """MCP tools against the real API in-process (httpx ASGI transport)."""
 
 import json
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -14,7 +15,7 @@ from mnemosyne.mcp_server import (
     list_meetings,
     search_meetings,
 )
-from mnemosyne.models.session import ActionItem, SummaryData
+from mnemosyne.models.session import ActionItem, Session, SummaryData
 from mnemosyne.models.transcript import TranscriptSegment
 
 
@@ -119,3 +120,47 @@ async def test_local_only_meetings_are_not_shared(backend, ctx, seeded, fake_pro
     out = await ask_meetings(backend, "When does the migration ship?")
     assert "October" not in json.dumps(fake_provider.calls)
     assert "Release sync" not in out
+
+
+@pytest.mark.anyio
+async def test_action_items_linked_task_listed_once(backend, ctx):
+    for day, text in ((1, "Rotate keys"), (8, "Rotate all the keys")):
+        ctx.repo.save(
+            Session(
+                name=f"Infra {day}",
+                created_at=datetime.now().replace(microsecond=0) - timedelta(days=10 - day),
+                summary="s",
+                summary_data=SummaryData(
+                    action_items=[ActionItem(id="i", text=text, owner="Bob", task_id="t1")]
+                ),
+            )
+        )
+    out = await get_action_items(backend, days=30)
+    assert out.count("Rotate") == 1
+    assert "- [ ] Rotate all the keys (Bob) (also in 1 earlier meeting)" in out
+    assert "## Infra 8" in out and "## Infra 1" not in out
+
+
+@pytest.mark.anyio
+async def test_get_meeting_lists_open_comment_threads(backend, ctx, seeded):
+    from mnemosyne.models.comment import CommentCreate
+    from mnemosyne.services import comments
+
+    root = comments.create(
+        ctx,
+        seeded.id,
+        CommentCreate(text="Is October firm?", target="body", exact="We agreed on October."),
+    )
+    comments.create(ctx, seeded.id, CommentCreate(text="Yes, it is", parent_id=root.id))
+    done = comments.create(
+        ctx, seeded.id, CommentCreate(text="Old question", target="body", exact="agreed on October")
+    )
+    comments.resolve(ctx, seeded.id, done.id)
+
+    out = await get_meeting(backend, seeded.id)
+    section = out.split("## Open comments\n", 1)[1]
+    assert section.startswith("- ")
+    assert "- " in section.splitlines()[0] and "Is October firm?" in section.splitlines()[0]
+    assert "(on “We agreed on October.”)" in section.splitlines()[0]
+    assert "\n  - " in section and "Yes, it is" in section
+    assert "Old question" not in out

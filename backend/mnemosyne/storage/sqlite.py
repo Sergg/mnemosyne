@@ -11,6 +11,7 @@ import logging
 import re
 import sqlite3
 import threading
+from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -18,9 +19,10 @@ from uuid import uuid4
 
 from .. import access
 from ..models.ask import Ask, Citation, Passage, PassageLine
+from ..models.comment import TARGET_LABELS, Comment
 from ..models.digest import Digest
 from ..models.live_flag import LiveFlag
-from ..models.search import SearchHit, SegmentHit
+from ..models.search import CommentHit, SearchHit, SegmentHit
 from ..models.session import (
     AgendaItem,
     Asset,
@@ -71,6 +73,28 @@ CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE OF name, summary, notes ON
 END;
 CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
     DELETE FROM sessions_fts WHERE rowid = old.rowid;
+END;
+"""
+
+# Keyword search over comments (text + the quote they were written about); a deleted comment is
+# not indexed. Own constant: it needs the comments table, which comes late in SCHEMA.
+COMMENT_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+    text, quote, session_id UNINDEXED, comment_id UNINDEXED,
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments WHEN new.deleted = 0 BEGIN
+    INSERT INTO comments_fts(rowid, text, quote, session_id, comment_id)
+    VALUES (new.rowid, new.text, new.quote, new.session_id, new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE OF text, quote, deleted, session_id
+ON comments BEGIN
+    DELETE FROM comments_fts WHERE rowid = old.rowid;
+    INSERT INTO comments_fts(rowid, text, quote, session_id, comment_id)
+    SELECT new.rowid, new.text, new.quote, new.session_id, new.id WHERE new.deleted = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
+    DELETE FROM comments_fts WHERE rowid = old.rowid;
 END;
 """
 
@@ -183,6 +207,29 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 );
 CREATE INDEX IF NOT EXISTS bookmarks_session ON bookmarks(session_id);
 
+-- Comments travel inside their meeting (library sync). `anchor` is JSON: {part, start, end} for
+-- a transcript span, {exact, prefix, suffix} for summary text; `target_id` names a summary
+-- block. A deleted comment with replies stays as an empty row (`deleted`).
+CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    parent_id TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    anchor TEXT NOT NULL DEFAULT '{}',
+    quote TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    author_id TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    mentions TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by TEXT NOT NULL DEFAULT '',
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS comments_session ON comments(session_id);
+{COMMENT_FTS}
 -- Live lines marked "Not said" while recording (keyboard noise heard as "yeah"): the final
 -- transcript drops its lines that overlap them (services/live_flags.py). start/"end" are the
 -- live transcript's own seconds, i.e. into `part`'s recording, as the live_segment events had.
@@ -249,6 +296,35 @@ CREATE TABLE IF NOT EXISTS summary_docs (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
     doc TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+-- Live shared notes (services/shared_notes.py): the frames clients sent, in arrival order, as
+-- the relay got them (opaque hashseq bytes: 0xDE deltas, 0xAF artifacts), with who sent each.
+-- `folded` frames are in the snapshot; their rows stay for per-frame authorship.
+CREATE TABLE IF NOT EXISTS shared_notes_ops (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    frame BLOB NOT NULL,
+    author_id TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    folded INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, seq)
+);
+-- The folded document (the sidecar's snapshot, up to `folded_seq`), its markdown as last
+-- folded (Session.notes differing from it = written around the document, which catches up),
+-- its plain text and each comment mark's range in it as last folded (`comment_ranges`, JSON
+-- {comment id: [start, end) | null}, code points; services/comments.py places notes comments
+-- from them), and the last edit shown.
+CREATE TABLE IF NOT EXISTS shared_notes (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    snapshot BLOB,
+    folded_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    last_by TEXT NOT NULL DEFAULT '',
+    last_at TEXT,
+    markdown TEXT,
+    plain TEXT,
+    comment_ranges TEXT
 );
 CREATE TABLE IF NOT EXISTS session_assets (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -361,7 +437,12 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
     name TEXT NOT NULL
 );
 """
-SCHEMA = SCHEMA.replace("{FTS_TRIGGERS}", FTS_TRIGGERS)
+SCHEMA = SCHEMA.replace("{FTS_TRIGGERS}", FTS_TRIGGERS).replace("{COMMENT_FTS}", COMMENT_FTS)
+
+
+def _ranges_json(comments: dict | None) -> str | None:
+    """A fold's comment ranges ({id: [start, end] | None}) as stored; None = not known."""
+    return None if comments is None else json.dumps(comments, sort_keys=True)
 
 
 def _dt(value: str) -> datetime:
@@ -582,6 +663,14 @@ class SessionRepository:
             "UPDATE session_events SET uid = lower(hex(randomblob(8))) WHERE uid IS NULL"
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS session_events_uid ON session_events(uid)")
+        if "markdown" not in {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(shared_notes)")
+        }:
+            self._conn.execute("ALTER TABLE shared_notes ADD COLUMN markdown TEXT")
+        notes_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(shared_notes)")}
+        for col in ("plain", "comment_ranges"):
+            if col not in notes_cols:
+                self._conn.execute(f"ALTER TABLE shared_notes ADD COLUMN {col} TEXT")
         self._conn.commit()
 
     def _migrate_fts_rowids(self) -> None:
@@ -625,6 +714,11 @@ class SessionRepository:
                 self._conn.execute(
                     "INSERT INTO sessions_fts(rowid, name, summary, notes, session_id)"
                     " SELECT rowid, name, summary, notes, id FROM sessions"
+                )
+            if self._conn.execute("SELECT count(*) FROM comments_fts").fetchone()[0] == 0:
+                self._conn.execute(
+                    "INSERT INTO comments_fts(rowid, text, quote, session_id, comment_id)"
+                    " SELECT rowid, text, quote, session_id, id FROM comments WHERE deleted=0"
                 )
             self._conn.execute(
                 "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
@@ -1250,6 +1344,242 @@ class SessionRepository:
             if moved:
                 self._touch_all(moves)
 
+    # ---- comments ------------------------------------------------------
+
+    _COMMENT_FIELDS = frozenset(
+        {
+            "id", "parent_id", "target", "target_id", "anchor", "quote", "text", "author_id",
+            "author", "mentions", "created_at", "updated_at",
+        }
+    )  # fmt: skip
+
+    @staticmethod
+    def _comment(r: sqlite3.Row) -> Comment:
+        return Comment(
+            id=r["id"],
+            session_id=r["session_id"],
+            parent_id=r["parent_id"],
+            target=r["target"],
+            target_id=r["target_id"],
+            anchor=json.loads(r["anchor"] or "{}"),
+            quote=r["quote"],
+            text=r["text"],
+            author_id=r["author_id"],
+            author=r["author"],
+            mentions=json.loads(r["mentions"] or "[]"),
+            created_at=_dt(r["created_at"]),
+            updated_at=_dt(r["updated_at"]),
+            resolved_at=_dt(r["resolved_at"]) if r["resolved_at"] else None,
+            resolved_by=r["resolved_by"],
+            deleted=bool(r["deleted"]),
+        )
+
+    def _comment_session(self, comment_id: str) -> str | None:
+        """The meeting a comment is in, or None; Hidden when the caller may not see it."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT session_id FROM comments WHERE id=?", (comment_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        if not self._readable(row["session_id"]):
+            raise access.Hidden("Session not found")
+        return row["session_id"]
+
+    def comment_rows(self, session_id: str) -> list[dict]:
+        """A meeting's comments as stored (JSON columns decoded), no access check: for library
+        sync, which sends whole meetings."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM comments WHERE session_id=? ORDER BY created_at, id", (session_id,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["anchor"] = json.loads(d["anchor"] or "{}")
+            d["mentions"] = json.loads(d["mentions"] or "[]")
+            d["deleted"] = bool(d["deleted"])
+            out.append(d)
+        return out
+
+    def open_comment_counts(self, visible: set[str] | None = None) -> Counter:
+        """Open (not resolved, not deleted) root threads on action items and decisions, by
+        (session_id, target, target_id), over the meetings in `visible` (None = all)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, target, target_id, COUNT(*) AS n FROM comments"
+                " WHERE parent_id='' AND deleted=0 AND resolved_at IS NULL"
+                " AND target IN ('item','decision') AND target_id!=''"
+                " GROUP BY session_id, target, target_id"
+            ).fetchall()
+        out: Counter = Counter()
+        for r in rows:
+            if visible is None or r["session_id"] in visible:
+                out[(r["session_id"], r["target"], r["target_id"])] += r["n"]
+        return out
+
+    def list_comments(self, session_id: str) -> list[Comment]:
+        """A meeting's comments, oldest first, deleted ones included (they hold threads
+        together). Empty for a meeting that is not there; Hidden when the caller may not
+        see it."""
+        if self._owner(session_id) is None:
+            return []
+        if not self._readable(session_id):
+            raise access.Hidden("Session not found")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM comments WHERE session_id=? ORDER BY created_at, id", (session_id,)
+            ).fetchall()
+        return [self._comment(r) for r in rows]
+
+    def get_comment(self, comment_id: str) -> Comment | None:
+        if self._comment_session(comment_id) is None:
+            return None
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM comments WHERE id=?", (comment_id,)).fetchone()
+        return None if row is None else self._comment(row)
+
+    def add_comment(self, session_id: str, **fields) -> str:
+        """Add a comment (any of `_COMMENT_FIELDS`; `text` is required) and return its id (minted
+        here, unless `id` is given: a notes comment's mark carries it). Readers may comment: who
+        may do what beyond that is the service's rule."""
+        unknown = set(fields) - self._COMMENT_FIELDS
+        if unknown:
+            raise TypeError(f"Unknown comment fields: {', '.join(sorted(unknown))}")
+        if "text" not in fields:
+            raise TypeError("A comment needs text")
+        if not self._readable(session_id):
+            raise access.Hidden("Session not found")
+        now = datetime.now().isoformat()
+        comment_id = fields.get("id") or uuid4().hex[:12]
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO comments (id, session_id, parent_id, target, target_id, anchor,"
+                " quote, text, author_id, author, mentions, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    comment_id,
+                    session_id,
+                    fields.get("parent_id", ""),
+                    fields.get("target", ""),
+                    fields.get("target_id", ""),
+                    json.dumps(fields.get("anchor") or {}, sort_keys=True),
+                    fields.get("quote", ""),
+                    fields["text"],
+                    fields.get("author_id", ""),
+                    fields.get("author", ""),
+                    json.dumps(fields.get("mentions") or []),
+                    fields.get("created_at") or now,
+                    fields.get("updated_at") or now,
+                ),
+            )
+            self._touch(session_id)
+        return comment_id
+
+    def update_comment_text(
+        self, comment_id: str, text: str, mentions: list[str] | None = None
+    ) -> bool:
+        """Edit a comment (and its @mentions when given). False when it is gone or deleted."""
+        session_id = self._comment_session(comment_id)
+        if session_id is None:
+            return False
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE comments SET text=?, updated_at=?,"
+                " mentions=CASE WHEN ? IS NULL THEN mentions ELSE ? END"
+                " WHERE id=? AND deleted=0",
+                (
+                    text,
+                    datetime.now().isoformat(),
+                    None if mentions is None else json.dumps(mentions),
+                    None if mentions is None else json.dumps(mentions),
+                    comment_id,
+                ),
+            )
+            if cur.rowcount:
+                self._touch(session_id)
+        return cur.rowcount > 0
+
+    def set_comment_resolved(
+        self, comment_id: str, resolved_at: datetime | None, resolved_by: str = ""
+    ) -> bool:
+        """Resolve a comment (when, by whom) or reopen it (`resolved_at=None`)."""
+        session_id = self._comment_session(comment_id)
+        if session_id is None:
+            return False
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE comments SET resolved_at=?, resolved_by=? WHERE id=?",
+                (
+                    None if resolved_at is None else resolved_at.isoformat(),
+                    "" if resolved_at is None else resolved_by,
+                    comment_id,
+                ),
+            )
+            if cur.rowcount:
+                self._touch(session_id)
+        return cur.rowcount > 0
+
+    def delete_comment(self, comment_id: str) -> bool:
+        """Remove a comment: the row goes when nothing replies to it, else it stays as an empty
+        `deleted` one so the replies keep their thread. False when it is gone or already deleted."""
+        session_id = self._comment_session(comment_id)
+        if session_id is None:
+            return False
+        with self._lock, self._conn:
+            replied = self._conn.execute(
+                "SELECT 1 FROM comments WHERE parent_id=? LIMIT 1", (comment_id,)
+            ).fetchone()
+            if replied is None:
+                cur = self._conn.execute("DELETE FROM comments WHERE id=?", (comment_id,))
+            else:
+                cur = self._conn.execute(
+                    "UPDATE comments SET deleted=1, text='', mentions='[]', updated_at=?"
+                    " WHERE id=? AND deleted=0",
+                    (datetime.now().isoformat(), comment_id),
+                )
+            if cur.rowcount:
+                self._touch(session_id)
+        return cur.rowcount > 0
+
+    def move_comments(self, moves: list[tuple[str, int, str, int]]) -> None:
+        """(session, part) -> (session, part), all at once, like move_bookmarks: meetings
+        combined (services/combine.py) renumber their parts, and a transcript comment's anchor
+        carries its `part`. Comments of a meeting that is absorbed and name no part (on the
+        summary) come along to the one meeting it joins; one on a part that is not in `moves`
+        comes along without its place (it shows as detached, with its quote)."""
+        where = {(old_s, old_p): (new_s, new_p) for old_s, old_p, new_s, new_p in moves}
+        targets = {new_s for _, _, new_s, _ in moves}
+        sources = {old_s for old_s, _, _, _ in moves} - targets
+        join = next(iter(targets)) if len(targets) == 1 else None
+        with self._lock, self._conn:
+            rows = self._conn.execute("SELECT id, session_id, anchor FROM comments").fetchall()
+            moved = False
+            for r in rows:
+                anchor = json.loads(r["anchor"] or "{}")
+                part = anchor.get("part")
+                if isinstance(part, int):
+                    if (dest := where.get((r["session_id"], part))) is not None:
+                        anchor["part"] = dest[1]
+                        new_session = dest[0]
+                    elif r["session_id"] in sources and join is not None:
+                        for key in ("part", "start", "end"):
+                            anchor.pop(key, None)
+                        new_session = join
+                    else:
+                        continue
+                elif r["session_id"] in sources and join is not None:
+                    new_session = join
+                else:
+                    continue
+                self._conn.execute(
+                    "UPDATE comments SET session_id=?, anchor=? WHERE id=?",
+                    (new_session, json.dumps(anchor, sort_keys=True), r["id"]),
+                )
+                moved = True
+            if moved:
+                self._touch_all(moves)
+
     # ---- live flags ----------------------------------------------------
 
     def add_live_flag(
@@ -1398,6 +1728,241 @@ class SessionRepository:
     def delete_summary_doc(self, session_id: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM summary_docs WHERE session_id=?", (session_id,))
+
+    # ---- live shared notes (services/shared_notes.py; no access checks: the caller checks) --
+
+    def notes_doc(self, session_id: str) -> dict | None:
+        """The folded document: {snapshot (bytes or None), folded_seq, updated_at, last_by,
+        last_at, markdown}, or None when the meeting has none yet."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT snapshot, folded_seq, updated_at, last_by, last_at, markdown"
+                " FROM shared_notes"
+                " WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def notes_source(self, session_id: str) -> tuple[str, str] | None:
+        """(Session.notes, origin) without loading the meeting, or None for an unknown one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT notes, origin FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        return None if row is None else (row["notes"] or "", row["origin"] or "")
+
+    def has_notes_doc(self, session_id: str) -> bool:
+        """A document exists: a stored snapshot or any frame."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM shared_notes WHERE session_id=?"
+                " AND snapshot IS NOT NULL)"
+                " OR EXISTS(SELECT 1 FROM shared_notes_ops WHERE session_id=?) AS has",
+                (session_id, session_id),
+            ).fetchone()
+        return bool(row["has"])
+
+    def notes_catchup(self, session_id: str) -> tuple[dict | None, list[tuple[int, bytes]]]:
+        """The folded document and the frames after it, read together: a fold committing between
+        two separate reads would hand out the old snapshot without the frames it just folded."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT snapshot, folded_seq, updated_at, last_by, last_at, markdown"
+                " FROM shared_notes WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            doc = None if row is None else dict(row)
+            rows = self._conn.execute(
+                "SELECT seq, frame FROM shared_notes_ops WHERE session_id=? AND seq>? ORDER BY seq",
+                (session_id, doc["folded_seq"] if doc else 0),
+            ).fetchall()
+        return doc, [(r["seq"], bytes(r["frame"])) for r in rows]
+
+    def has_unfolded_notes(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM shared_notes_ops WHERE session_id=? AND folded=0 LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def notes_ops(self, session_id: str) -> list[dict]:
+        """Every frame with its author, in log order (folded ones too)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, frame, author_id, author, at, folded FROM shared_notes_ops"
+                " WHERE session_id=? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        return [{**dict(r), "frame": bytes(r["frame"])} for r in rows]
+
+    def append_notes_ops(
+        self, session_id: str, frames: list[bytes], author_id: str, author: str, last_edit: bool
+    ) -> list[int]:
+        """Append frames to the log; their sequence numbers. `last_edit`: show `author` as the
+        last to edit."""
+        if not frames:
+            return []
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS top FROM shared_notes_ops WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            seqs = list(range(row["top"] + 1, row["top"] + 1 + len(frames)))
+            self._conn.executemany(
+                "INSERT INTO shared_notes_ops (session_id, seq, frame, author_id, author, at)"
+                " VALUES (?,?,?,?,?,?)",
+                [
+                    (session_id, s, f, author_id, author, now)
+                    for s, f in zip(seqs, frames, strict=True)
+                ],
+            )
+            self._conn.execute(
+                "INSERT INTO shared_notes (session_id, updated_at, last_by, last_at)"
+                " VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET"
+                " last_by=CASE WHEN ? THEN excluded.last_by ELSE last_by END,"
+                " last_at=CASE WHEN ? THEN excluded.last_at ELSE last_at END",
+                (
+                    session_id,
+                    now,
+                    author if last_edit else "",
+                    now if last_edit else None,
+                    int(last_edit),
+                    int(last_edit),
+                ),
+            )
+        return seqs
+
+    def store_notes_fold(
+        self,
+        session_id: str,
+        snapshot: bytes,
+        upto_seq: int,
+        markdown: str | None,
+        plain: str | None = None,
+        comments: dict | None = None,
+    ) -> None:
+        """The snapshot now holds every frame up to `upto_seq` and renders as `markdown` (None:
+        not known, e.g. a snapshot merged in by sync before its fold; no catching up then).
+        `plain` and `comments` are the fold's plain text and each comment mark's range in it
+        (the sidecar's answer; None = not known, then notes comments show as detached).
+
+        A snapshot that differs from the stored one (the document's first, or formatting, comment
+        marks and artifacts that leave the markdown alone) is a new version of the meeting for
+        library sync (`_touch`), or it would never travel. Not when `Session.notes` is about to
+        change anyway: the caller's write of it counts, once. Unchanged: no new version."""
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            before = self._conn.execute(
+                "SELECT snapshot FROM shared_notes WHERE session_id=?", (session_id,)
+            ).fetchone()
+            self._conn.execute(
+                "INSERT INTO shared_notes (session_id, snapshot, folded_seq, updated_at, markdown,"
+                " plain, comment_ranges) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE"
+                " SET snapshot=excluded.snapshot, folded_seq=excluded.folded_seq,"
+                " updated_at=excluded.updated_at, markdown=excluded.markdown,"
+                " plain=excluded.plain, comment_ranges=excluded.comment_ranges",
+                (session_id, snapshot, upto_seq, now, markdown, plain, _ranges_json(comments)),
+            )
+            self._conn.execute(
+                "UPDATE shared_notes_ops SET folded=1 WHERE session_id=? AND seq<=? AND folded=0",
+                (session_id, upto_seq),
+            )
+            old = (
+                None if before is None or before["snapshot"] is None else bytes(before["snapshot"])
+            )
+            if old != bytes(snapshot):
+                row = self._conn.execute(
+                    "SELECT notes FROM sessions WHERE id=?", (session_id,)
+                ).fetchone()
+                if row is not None and (markdown is None or (row["notes"] or "") == markdown):
+                    self._touch(session_id)
+
+    def store_synced_notes_doc(
+        self,
+        session_id: str,
+        snapshot: bytes,
+        markdown: str | None,
+        frames: list[bytes],
+        author: str,
+        notes: str | None = None,
+        plain: str | None = None,
+        comments: dict | None = None,
+    ) -> list[int]:
+        """A notes document that came by library sync (services/sync_notes.py), one transaction:
+        `frames` (what the local snapshot lacked of it, for the connected editors) are appended
+        to the log as `author`, already folded; `snapshot` (the union, or the peer's document
+        adopted where there was none) becomes the stored one with its `markdown`; `notes`, when
+        given, becomes `Session.notes` in the same breath; `plain` and `comments` as in
+        `store_notes_fold`. No new version (`_touch`): the sync
+        apply path counts it. Frames that arrived from editors meanwhile (unfolded, so not in
+        `snapshot`) stay unfolded. Returns the appended frames' sequence numbers."""
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            top = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS top FROM shared_notes_ops WHERE session_id=?",
+                (session_id,),
+            ).fetchone()["top"]
+            seqs = list(range(top + 1, top + 1 + len(frames)))
+            self._conn.executemany(
+                "INSERT INTO shared_notes_ops (session_id, seq, frame, author_id, author, at,"
+                " folded) VALUES (?,?,?,?,?,?,1)",
+                [(session_id, q, f, "", author, now) for q, f in zip(seqs, frames, strict=True)],
+            )
+            self._conn.execute(
+                "INSERT INTO shared_notes (session_id, snapshot, folded_seq, updated_at, markdown,"
+                " plain, comment_ranges) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE"
+                " SET snapshot=excluded.snapshot, updated_at=excluded.updated_at,"
+                " markdown=excluded.markdown, plain=excluded.plain,"
+                " comment_ranges=excluded.comment_ranges,"
+                " folded_seq=MAX(folded_seq, excluded.folded_seq)",
+                (
+                    session_id,
+                    snapshot,
+                    seqs[-1] if seqs else 0,
+                    now,
+                    markdown,
+                    plain,
+                    _ranges_json(comments),
+                ),
+            )
+            if notes is not None:
+                self._conn.execute("UPDATE sessions SET notes=? WHERE id=?", (notes, session_id))
+        return seqs
+
+    def notes_marks(self, session_id: str) -> tuple[str, dict[str, list[int] | None]] | None:
+        """(plain text, {comment id: [start, end) | None}) of the document as last folded, for
+        placing notes comments; None when nothing was stored (no document, or folded before the
+        ranges were kept, or by a sidecar that did not report them)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT plain, comment_ranges FROM shared_notes WHERE session_id=?", (session_id,)
+            ).fetchone()
+        if row is None or row["plain"] is None or row["comment_ranges"] is None:
+            return None
+        try:
+            ranges = json.loads(row["comment_ranges"])
+        except ValueError:
+            return None
+        return row["plain"], ranges if isinstance(ranges, dict) else {}
+
+    def set_notes_markdown(self, session_id: str, markdown: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE shared_notes SET markdown=? WHERE session_id=?", (markdown, session_id)
+            )
+
+    def notes_drift(self, session_id: str) -> str | None:
+        """Session.notes when it differs from the document's last folded markdown (it was
+        written around the document), else None. None too without a folded document."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT s.notes FROM sessions s JOIN shared_notes n ON n.session_id = s.id"
+                " WHERE s.id=? AND n.markdown IS NOT NULL AND s.notes IS NOT n.markdown",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else (row["notes"] or "")
 
     def events(self, session_id: str) -> list[dict]:
         if not self._readable(session_id):
@@ -1779,6 +2344,102 @@ class SessionRepository:
             self._touch(session_id)
         return True
 
+    # By item id (ActionItem.id) rather than list position, for writes that reach several
+    # meetings at once (services/task_links.py): positions shift under re-summaries, ids do not.
+    _BY_ID_FIELDS = frozenset({"done", "follow", "task_id", "issue_url"})
+    _FAN_OUT_FIELDS = frozenset({"done", "follow", "issue_url"})
+
+    def set_action_item_flag_by_id(
+        self, session_id: str, item_id: str, flag: str, value: bool
+    ) -> bool:
+        """`set_action_item_done` / `_follow` by item id: `flag` is "done" or "follow". Read
+        access suffices, as for the index-based ones."""
+        if flag not in ("done", "follow"):
+            raise ValueError(f"Not an action item flag: {flag}")
+        return self.set_action_item_fields_by_id(session_id, item_id, **{flag: value})
+
+    def set_action_item_fields_by_id(self, session_id: str, item_id: str, **fields) -> bool:
+        """Set `done`, `follow`, `task_id` and/or `issue_url` on the action item with this id.
+        `issue_url` needs write access (as creating an issue does, Forbidden/Hidden otherwise);
+        the others read access, like ticking: a reader links a task they were given. True
+        when the item exists (the meeting is only bumped when a value changed), False for no
+        such (visible) meeting or item."""
+        bad = set(fields) - self._BY_ID_FIELDS
+        if bad:
+            raise ValueError(f"Cannot set action item fields: {sorted(bad)}")
+        if "issue_url" in fields:
+            self._check_write(session_id)
+        if not self._readable(session_id):
+            return False
+        return self._write_item_by_id(session_id, item_id, fields)
+
+    def fan_out_action_item_fields(self, session_id: str, item_id: str, **fields) -> bool:
+        """INTERNAL, for services/task_links.py only: the same write WITHOUT any access check,
+        so a task's done/follow/issue_url reaches every meeting that mentions it, also on a
+        team server where the caller cannot see some of them (it is the same task; the history
+        line names who changed it). Only `done`, `follow` and `issue_url`: never text, owner or
+        the link itself. Callers must have checked that the caller may change the task."""
+        bad = set(fields) - self._FAN_OUT_FIELDS
+        if bad:
+            raise ValueError(f"Cannot fan out action item fields: {sorted(bad)}")
+        return self._write_item_by_id(session_id, item_id, fields)
+
+    def _write_item_by_id(self, session_id: str, item_id: str, fields: dict) -> bool:
+        if not item_id:
+            return False
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT summary_data FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None or not row["summary_data"]:
+                return False
+            data = SummaryData.model_validate_json(row["summary_data"])
+            item = next((a for a in data.action_items if a.id == item_id), None)
+            if item is None:
+                return False
+            if all(getattr(item, k) == v for k, v in fields.items()):
+                return True  # already so: no new version
+            for k, v in fields.items():
+                setattr(item, k, v)
+            self._conn.execute(
+                "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
+                (data.model_dump_json(), datetime.now().isoformat(), session_id),
+            )
+            self._touch(session_id)
+        return True
+
+    def set_decision_links(self, session_id: str, changes: dict[str, str]) -> bool:
+        """Set (`{decision id: object id}`) or remove (object id "") links in the meeting's
+        `summary_data.decision_links`, for services/decision_links.py; the decision texts are
+        never touched. Read access suffices (a reader links a decision they were given, as
+        with `task_id`). Only decisions the meeting has (by `decision_ids`) get a link. True
+        when the meeting exists and is visible (it is only bumped when something changed)."""
+        if not self._readable(session_id):
+            return False
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT summary_data FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None or not row["summary_data"]:
+                return False
+            data = SummaryData.model_validate_json(row["summary_data"])
+            links = dict(data.decision_links)
+            live = set(data.decision_ids)
+            for decision_id, object_id in changes.items():
+                if object_id and decision_id in live:
+                    links[decision_id] = object_id
+                else:
+                    links.pop(decision_id, None)
+            if links == data.decision_links:
+                return True
+            data.decision_links = links
+            self._conn.execute(
+                "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
+                (data.model_dump_json(), datetime.now().isoformat(), session_id),
+            )
+            self._touch(session_id)
+        return True
+
     def adopt_unowned(self, owner_id: str) -> int:
         """Meetings that belong to nobody (made before team mode) become this person's."""
         with self._lock, self._conn:
@@ -1910,6 +2571,15 @@ class SessionRepository:
                    ORDER BY score LIMIT ?""",
                 (fts, limit),
             ).fetchall()
+            com_rows = self._conn.execute(
+                """SELECT c.session_id, c.id, c.target, c.target_id, c.author, c.quote,
+                          snippet(comments_fts, -1, '[[', ']]', '…', 12) AS snip,
+                          bm25(comments_fts) AS score
+                   FROM comments_fts JOIN comments c ON c.rowid = comments_fts.rowid
+                   WHERE comments_fts MATCH ?
+                   ORDER BY score LIMIT ?""",
+                (fts, limit * 2),
+            ).fetchall()
             # speaker/start for segment hits
             details = {}
             for r in seg_rows:
@@ -1953,6 +2623,22 @@ class SessionRepository:
                     idx=r["idx"],
                     speaker=d["speaker"] if d else "",
                     start=float(d["start"]) if d else 0.0,
+                    snippet=r["snip"],
+                )
+            )
+            h.score += -float(r["score"])
+        for r in com_rows:
+            h = hit(r["session_id"])
+            if h is None or len(h.comments) >= per_session:
+                continue
+            h.comments.append(
+                CommentHit(
+                    id=r["id"],
+                    author=r["author"],
+                    target=r["target"],
+                    label=TARGET_LABELS.get(r["target"], ""),
+                    quote=r["quote"],
+                    target_id=r["target_id"],
                     snippet=r["snip"],
                 )
             )
@@ -2150,6 +2836,28 @@ class SessionRepository:
                     )
                 )
         return out
+
+    def action_item_sources(self) -> list[dict]:
+        """Every summarized meeting, newest first, as {id, name, created_at, owner_id,
+        attendees, summary_data (SummaryData)}, NOT filtered by access: for
+        services/task_links.py, which needs every mention of a task and filters by
+        `visible_ids()` itself. Same cost as `list_action_items`."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, created_at, owner_id, attendees, summary_data FROM sessions"
+                " WHERE summary_data IS NOT NULL ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "created_at": _dt(r["created_at"]),
+                "owner_id": r["owner_id"],
+                "attendees": json.loads(r["attendees"] or "[]"),
+                "summary_data": SummaryData.model_validate_json(r["summary_data"]),
+            }
+            for r in rows
+        ]
 
     def meeting_meta(self):
         """Name, date, attendees and summary of every session, without transcripts."""
@@ -2704,8 +3412,8 @@ class SessionRepository:
         """Everything of a meeting that library sync reads, as raw rows from one consistent
         snapshot, without access checks (the sync service is the machine itself, not a
         request): None when there is no such meeting. Keys: session, segments, recordings,
-        bookmarks, live_flags, external_notes, embeddings, assets (with `linked_at`), events
-        (with `uid`, oldest first)."""
+        bookmarks, live_flags, external_notes, comments (`comment_rows`),
+        embeddings, assets (with `linked_at`), events (with `uid`, oldest first)."""
 
         def rows(sql: str) -> list[dict]:
             return [dict(r) for r in self._conn.execute(sql, (session_id,)).fetchall()]
@@ -2727,6 +3435,7 @@ class SessionRepository:
                 "external_notes": rows(
                     "SELECT * FROM external_notes WHERE session_id=? ORDER BY added_at, id"
                 ),
+                "comments": self.comment_rows(session_id),
                 "embeddings": rows("SELECT * FROM session_speakers WHERE session_id=?"),
                 "assets": rows(
                     "SELECT a.*, sa.added_at AS linked_at FROM assets a"
@@ -2747,7 +3456,7 @@ class SessionRepository:
 
         Sets the session row (not `status` or `audio_file` of a meeting recorded here; for any
         other: `completed` when it has a transcript, else `created`, and no audio file), replaces
-        the transcript, bookmarks, external notes, live flags and speaker embeddings, the
+        the transcript, bookmarks, external notes, live flags, comments and speaker embeddings, the
         recordings rows (not for a meeting recorded here: the paths are ours and encryption
         rewrites them quietly), the asset links (assets we lack are added, without file bytes;
         a link we already have under another id is reused), and adds the history events whose
@@ -2833,6 +3542,33 @@ class SessionRepository:
                 [
                     (f.id, sid, f.source, f.start, f.end, f.text, f.created_at.isoformat(), f.part)
                     for f in s.live_flags
+                ],
+            )
+            self._conn.execute("DELETE FROM comments WHERE session_id=?", (sid,))
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO comments (id, session_id, parent_id, target, target_id,"
+                " anchor, quote, text, author_id, author, mentions, created_at, updated_at,"
+                " resolved_at, resolved_by, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        c.id,
+                        sid,
+                        c.parent_id,
+                        c.target,
+                        c.target_id,
+                        json.dumps(c.anchor),
+                        c.quote,
+                        c.text,
+                        c.author_id,
+                        c.author,
+                        json.dumps(c.mentions),
+                        c.created_at,
+                        c.updated_at,
+                        c.resolved_at,
+                        c.resolved_by,
+                        int(c.deleted),
+                    )
+                    for c in s.comments
                 ],
             )
             self._conn.execute("DELETE FROM session_speakers WHERE session_id=?", (sid,))

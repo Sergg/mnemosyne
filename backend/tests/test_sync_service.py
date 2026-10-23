@@ -4,7 +4,8 @@ from the other through `httpx.ASGITransport`. No network, no iroh. Text merges r
 stand-in sidecar (tests/fake_link.py), one scenario through the real mnemosyne-link if built."""
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
+from importlib.metadata import version as package_version
 
 import httpx
 import pytest
@@ -185,7 +186,12 @@ async def test_a_meeting_recorded_on_a_appears_on_b(nodes):
     async with b.client() as c:
         body = (await c.get("/api/sync/status")).json()
     (p,) = body["peers"]
-    assert (p["state"], p["received"], p["clashes"], p["app_version"]) == ("done", 0, [], "0.17.0")
+    assert (p["state"], p["received"], p["clashes"], p["app_version"]) == (
+        "done",
+        0,
+        [],
+        package_version("mnemosyne-backend"),
+    )
 
 
 async def test_hello_and_changes_serve_documents_and_tombstones(nodes):
@@ -317,6 +323,27 @@ async def test_notes_edited_on_both_sides_merge_without_doubling(nodes, sidecar)
         await pull(x, y)
     for n in (a, b):
         assert n.repo.get(sid).notes == "Intro.\nA's line.\nPlan.\nB's line.\n", n.name
+
+
+async def test_a_comment_added_on_b_reaches_a(nodes):
+    a, b = nodes
+    sid = meeting(a)
+    await pull(b, a)
+    root = b.repo.add_comment(sid, target="segment", text="Question?", author="B", author_id="u2")
+    b.repo.add_comment(sid, parent_id=root, text="Answer", author="B")
+    for x, y in ((a, b), (b, a)):
+        await pull(x, y)
+    assert [c["text"] for c in a.repo.comment_rows(sid)] == ["Question?", "Answer"]
+    assert a.repo.comment_rows(sid) == b.repo.comment_rows(sid)
+    # Both add one, a reply on A to B's, a resolve on B: all of it ends up on both.
+    ca = a.repo.add_comment(sid, text="From A", author="A")
+    b.repo.set_comment_resolved(root, datetime(2026, 10, 20, 12, 0, 0), "u2")
+    for x, y in ((a, b), (b, a), (a, b), (b, a)):
+        await pull(x, y)
+    for n in (a, b):
+        rows = {c["id"]: c for c in n.repo.comment_rows(sid)}
+        assert set(rows) >= {root, ca} and rows[root]["resolved_by"] == "u2", n.name
+    assert a.repo.comment_rows(sid) == b.repo.comment_rows(sid)
 
 
 # ---- deletes ------------------------------------------------------------------------------
@@ -577,3 +604,33 @@ async def test_real_sidecar_notes_merge_without_doubling(nodes, real_sidecar):
     for n in (a, b):
         assert n.repo.get(sid).notes == "Intro.\nA's line.\nPlan.\nB's line.\n", n.name
     assert vv(a, sid) == vv(b, sid)
+
+
+async def test_a_task_linked_across_meetings_settles_on_its_head_after_a_round(nodes, sidecar):
+    a, b = nodes
+    old = meeting(
+        a,
+        "Infra 1",
+        summary="S.\n",
+        summary_data=SummaryData(
+            action_items=[ActionItem(id="o1", text="Rotate keys", task_id="t1", done=True)]
+        ),
+    )
+    new = meeting(
+        a,
+        "Infra 2",
+        created_at=datetime.now() + timedelta(days=7),
+        summary="S.\n",
+        summary_data=SummaryData(
+            action_items=[ActionItem(id="n1", text="Rotate keys", task_id="t1", done=True)]
+        ),
+    )
+    await pull(b, a)
+    # A reopens the older mention only; B (concurrently) leaves the newest, the head, done.
+    assert a.repo.set_action_item_fields_by_id(old, "o1", done=False)
+    for x, y in ((b, a), (a, b), (b, a), (a, b)):
+        await pull(x, y)
+    for n in (a, b):
+        assert n.repo.get(new).summary_data.action_items[0].done is True
+        assert n.repo.get(old).summary_data.action_items[0].done is True
+    assert vv(a, old) == vv(b, old)
