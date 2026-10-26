@@ -29,6 +29,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import secrets
 import subprocess
 import threading
 import time
@@ -38,6 +40,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .. import access
+from ..models.shared_meeting import ShareParts
+from . import shared_with_me
 
 if TYPE_CHECKING:
     from ..api.context import AppContext
@@ -49,6 +53,7 @@ MAX_FRAME = 2 * 1024 * 1024  # ~40 B per typed character: a 6,500-character past
 FOLD_DELAY = 2.0  # seconds after the last frame
 FOLD_EVERY = 30.0  # at the latest, while frames keep coming
 LAST_EDIT_EVERY = 15.0  # a `last_edit` message at most this often for the same person
+CARET_EVERY = 0.1  # a `caret` message at most this often for the same member (the last one wins)
 DOC_TIMEOUT = 60.0
 SEED_AUTHOR, API_AUTHOR = "seed", "api"
 
@@ -156,6 +161,22 @@ class Member:
     can_edit: bool
     typing: bool = False
     seen_seq: int = 0  # the frames up to this one were in its catch-up
+    # A hidden member is no connection (`attach`): the guest bridge's tap on the room. It gets
+    # every frame in `out` (nobody sends from it), is never listed as present or typing, and
+    # hears none of the room's JSON (presence, last_edit, `broadcast_json`).
+    hidden: bool = False
+    # A hidden member that also hears `presence` and `caret` messages (never `guests`,
+    # `last_edit` or other `broadcast_json`): the guest bridge, which seals owner-side carets for
+    # the guests. It is never listed in `members`/`present` and cannot send presence.
+    presence_tap: bool = False
+    # Who this connection is in `presence.members`/`caret` messages: random at join. (Guests are
+    # `g:<gid>` elsewhere; one person's two windows are two keys.)
+    key: str = field(default_factory=lambda: "m" + secrets.token_hex(4))
+    # The selection last sent: {"a": anchor element id | None, "f": focus ... | None} (hex),
+    # or None. Memory only: never stored or logged.
+    sel: dict | None = None
+    caret_sent: float = float("-inf")  # loop time of the last `caret` message out
+    caret_timer: asyncio.TimerHandle | None = None  # the trailing flush of a coalesced one
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
     sender: asyncio.Task | None = None
 
@@ -170,11 +191,20 @@ class Room:
     fold_timer: asyncio.TimerHandle | None = None
     dirty_since: float | None = None  # loop time of the first frame since the last fold
     last_edit: tuple[str, float] = ("", 0.0)  # who, and when it was last announced
+    guests_msg: dict | None = None  # the last non-empty "guests" message, for later joiners
 
     def broadcast(self, kind: str, data: Any, skip: Member | None = None) -> None:
+        """To the visible members (not `skip`): a hidden one only wants frames."""
         for m in self.members:
-            if m is not skip:
+            if m is not skip and not m.hidden:
                 m.send(kind, data)
+
+    def broadcast_presence(self, data: dict, skip: Member | None = None) -> None:
+        """`presence` and `caret` messages: the visible members (not `skip`) and the taps."""
+        self.broadcast("json", data, skip=skip)
+        for m in self.members:
+            if m.hidden and m.presence_tap and m is not skip:
+                m.send("json", data)
 
 
 class Hub:
@@ -224,18 +254,30 @@ def _on_loop(app: AppContext, fn, *args) -> None:
 
 @contextmanager
 def unrestricted():
-    """Internal writes: who may edit was decided when the frame was accepted."""
+    """Internal writes: who may edit was decided when the frame was accepted. Also the app's own
+    writer (`access.internally`), so the fold of a meeting shared with me writes its notes."""
     token = access.current.set(None)
     try:
-        yield
+        with access.internally():
+            yield
     finally:
         access.current.reset(token)
 
 
 def may_edit(app: AppContext, session_id: str) -> bool:
-    """The caller may change this (readable) meeting's notes (access.can_edit_notes)."""
+    """The caller may change this (readable) meeting's notes (access.can_edit_notes). A
+    contact (phase 8, "p:<16 hex>") counts as shared with when their live share includes the
+    notes. A meeting someone shared with me: when they shared its notes (the owner's hub
+    decides the same for what I send, services/shares.py)."""
+    owner_key = shared_with_me.shared_from(app, session_id)
+    if owner_key:
+        parts = shared_with_me.parts_of(app, session_id, owner_key)
+        return parts is not None and parts.notes
     owner = app.repo.owner_of(session_id) or ""
     shared = {s["user_id"] for s in app.repo.shares(session_id)}
+    for share in app.repo.peer_shares(session_id):
+        if ShareParts.from_stored(share["parts"]).notes:
+            shared.add("p:" + share["person"][:16])
     return access.can_edit_notes(owner, shared)
 
 
@@ -326,7 +368,28 @@ def _fold_locked(app: AppContext, session_id: str, binary: str) -> bool:
         if app.repo.notes_source(session_id) is not None:
             raise
         return False
+    _derive_items(app, session_id, reply, [seq for seq, _ in ops])
     return _write_notes(app, session_id, markdown)
+
+
+def _derive_items(
+    app: AppContext, session_id: str, reply: dict, seqs: list[int], author: str | None = None
+) -> None:
+    """The meeting's action items from the notes (services/notes_items.py), from a fold result
+    of this machine: `seqs` are the request's frames (the reply's `frame` indexes them),
+    `author` who made what the request itself did (set_text). Never raises."""
+    from . import notes_items
+
+    tasks = reply.get("tasks")
+    if not isinstance(tasks, list):
+        return
+    try:
+        authors = app.repo.notes_op_authors(session_id, seqs)
+    except Exception:
+        logger.warning("Could not read the notes authors of %s", session_id, exc_info=True)
+        authors = []
+    fallback = author if author is not None else notes_items.unique_author(authors)
+    notes_items.apply(app, session_id, tasks, authors=authors, fallback=fallback)
 
 
 def _catch_up_locked(
@@ -400,6 +463,7 @@ def _set_text_blocking(
             app.repo.store_notes_fold(
                 session_id, folded, seqs[-1] if seqs else last, rendered, *marks_of(reply)
             )
+            _derive_items(app, session_id, reply, [seq for seq, _ in ops], author)
             _write_notes(app, session_id, rendered)
         else:
             _fold_locked(app, session_id, binary)
@@ -449,10 +513,63 @@ def mark_comment_blocking(
         if seqs[0] == last + 1:
             # Nothing came in meanwhile: the reply's snapshot is the whole log.
             app.repo.store_notes_fold(session_id, folded, seqs[-1], rendered, *marks_of(reply))
+            _derive_items(app, session_id, reply, [seq for seq, _ in ops])
             _write_notes(app, session_id, rendered)
         else:
             _fold_locked(app, session_id, binary)
         return list(zip(seqs, frames, strict=True))
+
+
+# ---- ticking a task line (phase 11, services/notes_items.py `write_fields`) ----------------
+
+
+def set_kind_blocking(
+    app: AppContext, session_id: str, line: str, kind: str, author_id: str, author: str
+) -> list[tuple[int, bytes]]:
+    """Make the task line whose `\\n` is element `line` open (`kind` "task") or done
+    ("task_done"), by the sidecar's `set_kind`: a tick made outside the editor (Tasks, a linked
+    mention's fan-out, reconcile) reaches the document (C16 of
+    docs/plans/2026-10-25-phase-11-tasks.md). As mark_comment_blocking: the frames are appended
+    to the log as `author`, folded (the notes items derived again), and sent to the meeting's
+    open editors; returned. [] when the line shows `kind` already. Raises NotesDocError (no
+    sidecar, an unknown or deleted line, not a task line, a failing run)."""
+    if kind not in ("task", "task_done"):
+        raise ValueError(f"Not a task kind: {kind}")
+    binary = _binary()
+    if binary is None:
+        raise NotesDocError("mnemosyne-link not found")
+    with hub(app).lock(session_id):
+        snapshot, ops, last = _state(app, session_id)
+        reply = _run_doc(
+            binary,
+            {
+                "op": "set_kind",
+                "notes": notes_origin(session_id),
+                "snapshot": snapshot,
+                "frames": [_b64(f) for _, f in ops],
+                "line": line,
+                "kind": kind,
+            },
+        )
+        try:
+            frames = [_unb64(f) for f in reply["frames"]]
+            folded = _unb64(reply["snapshot"])
+            rendered = str(reply["markdown"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise NotesDocError(f"unreadable set_kind reply: {e}") from e
+        seqs = app.repo.append_notes_ops(session_id, frames, author_id, author, False)
+        if not seqs:
+            return []
+        if seqs[0] == last + 1:
+            # Nothing came in meanwhile: the reply's snapshot is the whole log.
+            app.repo.store_notes_fold(session_id, folded, seqs[-1], rendered, *marks_of(reply))
+            _derive_items(app, session_id, reply, [seq for seq, _ in ops], author)
+            _write_notes(app, session_id, rendered)
+        else:
+            _fold_locked(app, session_id, binary)
+        out = list(zip(seqs, frames, strict=True))
+    _on_loop(app, _deliver, app, session_id, out, None)
+    return out
 
 
 def seed_blocking(app: AppContext, session_id: str) -> list[tuple[int, bytes]]:
@@ -472,17 +589,24 @@ def seed_blocking(app: AppContext, session_id: str) -> list[tuple[int, bytes]]:
         return _set_text_blocking(app, session_id, source[0], "", SEED_AUTHOR, False)
 
 
-def prepare_blocking(app: AppContext, session_id: str) -> list[tuple[int, bytes]]:
-    """Before a join: a meeting without a document is seeded, one with text written around
-    its document catches up. Returns the appended frames. Raises NotesDocError."""
+def ensure_doc_blocking(app: AppContext, session_id: str) -> list[tuple[int, bytes]]:
+    """The meeting's live document set up before anyone types into it or it is sent: the one
+    step for a join, frames sent through the hub (`accept_frames`) and a shared meeting
+    (services/shares.py). A meeting with notes but no document is seeded from them (only where
+    it was recorded, `seed_blocking`); one with text written around its document catches up. A
+    meeting waiting for its document from library sync is left alone. The frames this appended
+    go to the meeting's connections, and are returned. Raises NotesDocError (no sidecar, or it
+    failed)."""
     binary = _binary()
     if binary is None:
         raise NotesDocError("mnemosyne-link not found")
+    if needs_doc_from_sync(app, session_id):
+        return []
     with hub(app).lock(session_id):
-        seeded = seed_blocking(app, session_id)
-        if seeded:
-            return seeded
-        return _catch_up_locked(app, session_id, binary)[0]
+        added = seed_blocking(app, session_id) or _catch_up_locked(app, session_id, binary)[0]
+    if added:
+        _on_loop(app, _deliver, app, session_id, added, None)
+    return added
 
 
 def needs_doc_from_sync(app: AppContext, session_id: str) -> bool:
@@ -600,12 +724,77 @@ def _announce_edit(app: AppContext, session_id: str, by: str, skip: Member | Non
     )
 
 
+def _members(room: Room) -> list[dict]:
+    """The visible members for `presence.members`: `who` (the user id, else the name) is what the
+    caret colour is taken from."""
+    return [
+        {
+            "key": m.key,
+            "name": m.name,
+            "who": m.id or m.name,
+            "typing": m.typing,
+            "sel": m.sel,
+        }
+        for m in room.members
+        if not m.hidden
+    ]
+
+
 def _presence(room: Room) -> dict:
+    seen = [m for m in room.members if not m.hidden]
     return {
         "type": "presence",
-        "present": list(dict.fromkeys(m.name for m in room.members)),
-        "typing": list(dict.fromkeys(m.name for m in room.members if m.typing)),
+        "present": list(dict.fromkeys(m.name for m in seen)),
+        "typing": list(dict.fromkeys(m.name for m in seen if m.typing)),
+        "members": _members(room),
     }
+
+
+_HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _clean_sel(value: Any) -> tuple[bool, dict | None]:
+    """A client's `sel`: (valid, the selection). None is valid (no selection); `a` and `f` must
+    each be null or an element id (64 hex characters). Anything else is ignored whole."""
+    if value is None:
+        return True, None
+    if not isinstance(value, dict) or "a" not in value or "f" not in value:
+        return False, None
+    out = {}
+    for k in ("a", "f"):
+        v = value[k]
+        if v is not None and not (isinstance(v, str) and _HEX64.fullmatch(v)):
+            return False, None
+        out[k] = v.lower() if v is not None else None
+    return True, out
+
+
+def _send_caret(room: Room, member: Member, now: float) -> None:
+    member.caret_sent = now
+    room.broadcast_presence({"type": "caret", "key": member.key, "sel": member.sel}, skip=member)
+
+
+def _flush_caret(room: Room, member: Member) -> None:
+    member.caret_timer = None
+    if member in room.members:
+        _send_caret(room, member, asyncio.get_running_loop().time())
+
+
+def _move_caret(room: Room, member: Member, sel: dict | None) -> None:
+    """The member's selection changed. At most one `caret` per CARET_EVERY: inside the window the
+    newest position waits (replacing an older one) and goes out when the window ends."""
+    if member.sel == sel:
+        return
+    member.sel = sel
+    if member.caret_timer is not None:
+        return  # a flush is due and sends `member.sel` as it is then
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    wait = member.caret_sent + CARET_EVERY - now
+    if wait <= 0:
+        _send_caret(room, member, now)
+    else:
+        member.caret_timer = loop.call_later(wait, _flush_caret, room, member)
 
 
 def _schedule_fold(app: AppContext, room: Room) -> None:
@@ -685,12 +874,10 @@ async def join(
     waiting = await asyncio.to_thread(needs_doc_from_sync, app, session_id)
     if not waiting:
         try:
-            added = await asyncio.to_thread(prepare_blocking, app, session_id)
+            await asyncio.to_thread(ensure_doc_blocking, app, session_id)
         except NotesDocError as e:
             _warn_once(f"prep:{session_id}", "Could not open the notes of %s: %s", session_id, e)
             return None
-        if added:
-            _deliver(app, session_id, added, None)
     # Catch-up and joining the room in one step (no await in between): a frame appended now is
     # either in the backlog or relayed to the member, never neither or both.
     doc, ops = app.repo.notes_catchup(session_id)
@@ -707,9 +894,10 @@ async def join(
     hello = {
         "type": "hello",
         "notes": notes_origin(session_id),
-        "you": {"id": you_id, "name": you_name},
+        "you": {"id": you_id, "name": you_name, "key": member.key},
         "read_only": not member.can_edit,
         "present": _presence(room)["present"],
+        "members": _members(room),
         "last_edit": last,
         "snapshot": snapshot is not None,
         "backlog": len(ops),
@@ -717,42 +905,164 @@ async def join(
     if waiting:
         hello["waiting_for_sync"] = True
     member.send("json", hello)
+    if room.guests_msg is not None and not member.hidden:
+        member.send("json", room.guests_msg)
     if snapshot is not None:
         member.send("bytes", bytes(snapshot))
     for _, frame in ops:
         member.send("bytes", frame)
     member.sender = asyncio.get_running_loop().create_task(_sender(member))
-    room.broadcast("json", _presence(room), skip=member)
+    room.broadcast_presence(_presence(room), skip=member)
     return member
 
 
-def receive_frame(app: AppContext, session_id: str, member: Member, frame: bytes) -> int | None:
-    """A frame from a member: logged and relayed. None, or the close code it is refused with."""
-    if not member.can_edit:
-        return CLOSE_READ_ONLY
-    if not frame or frame[0] not in (DELTA, ARTIFACT):
-        return CLOSE_BAD_FRAME
-    if len(frame) > MAX_FRAME:
-        return CLOSE_TOO_BIG
+def attach(app: AppContext, session_id: str, member: Member) -> None:
+    """Add a hidden member (`Member.hidden`, no WebSocket) to the meeting's room, making the
+    room if needed: `_deliver` then puts every frame appended from now on into `member.out`
+    (not the ones in the log already: `member.seen_seq` is set from the current catch-up, as a
+    join does). On the event loop. Frames it injects itself go through
+    `accept_frames(..., skip=member)`, so they are not delivered back."""
+    _remember_loop(app)
+    doc, ops = app.repo.notes_catchup(session_id)
+    room = hub(app).rooms.setdefault(session_id, Room(session_id))
+    member.hidden = True
+    member.seen_seq = max(ops[-1][0] if ops else 0, doc["folded_seq"] if doc else 0)
+    if member not in room.members:
+        room.members.append(member)
+    if member.presence_tap:
+        member.send("json", _presence(room))
+
+
+def detach(app: AppContext, session_id: str, member: Member) -> None:
+    """Remove a member added by `attach`. Like the last `leave`, the member that empties the
+    room folds the notes. On the event loop."""
     room = hub(app).rooms.get(session_id)
-    if room is None:
-        return CLOSE_BAD_FRAME
-    edit = frame[0] == DELTA
+    if room is None or member not in room.members:
+        return
+    room.members.remove(member)
+    _after_departure(app, room, member)
+
+
+def broadcast_json(app: AppContext, session_id: str, msg: dict) -> None:
+    """A JSON text message to every visible member of the meeting's room (nobody: nothing)."""
+    room = hub(app).rooms.get(session_id)
+    if room is not None:
+        if msg.get("type") == "guests":
+            room.guests_msg = msg if msg.get("present") else None
+        room.broadcast("json", msg)
+
+
+class FramesRefused(Exception):
+    """Frames not taken: `code` is the close code a connection would get (CLOSE_*), the
+    message says why."""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+
+
+def _check_frames(frames: list[bytes]) -> None:
+    for frame in frames:
+        if not frame or frame[0] not in (DELTA, ARTIFACT):
+            raise FramesRefused(CLOSE_BAD_FRAME, "Not a notes frame")
+        if len(frame) > MAX_FRAME:
+            raise FramesRefused(CLOSE_TOO_BIG, "A notes frame is too big")
+
+
+def accept_frames(
+    app: AppContext,
+    session_id: str,
+    frames: list[bytes],
+    author_id: str,
+    author: str,
+    *,
+    skip: Member | None = None,
+    can_edit: bool | None = None,
+) -> list[int]:
+    """Frames typed by `author`: checked by tag and size, appended to the log, relayed to the
+    meeting's connections (not `skip`, the one that sent them), and a fold scheduled. The one
+    path for every frame from outside: a connection's (`receive_frame`, which decided
+    `can_edit` when it joined) and a contact's sent through the hub (phase 8,
+    services/shares.py; `can_edit` None: decided here, by `may_edit` for the caller, and the
+    meeting's document prepared first as for a join). Callable on the event loop or from a
+    thread. Returns the frames' sequence numbers. Raises FramesRefused, and nothing is
+    logged then."""
+    if not frames:
+        return []
+    _check_frames(frames)
+    if can_edit is None:
+        if not available():
+            raise FramesRefused(CLOSE_GONE, "Live notes are not available on this computer")
+        if needs_doc_from_sync(app, session_id):
+            raise FramesRefused(CLOSE_READ_ONLY, "The notes are not here yet")
+        if not may_edit(app, session_id):
+            raise FramesRefused(CLOSE_READ_ONLY, "You may not edit these notes")
+        try:
+            # As a join does: the frames merge with what is there, never replace it.
+            ensure_doc_blocking(app, session_id)
+        except NotesDocError as e:
+            raise FramesRefused(CLOSE_GONE, "The notes cannot be opened now") from e
+    elif not can_edit:
+        raise FramesRefused(CLOSE_READ_ONLY, "You may not edit these notes")
+    edit = any(f[0] == DELTA for f in frames)
     try:
-        app.repo.append_notes_ops(session_id, [frame], member.id, member.name, last_edit=edit)
+        seqs = app.repo.append_notes_ops(session_id, frames, author_id, author, last_edit=edit)
     except Exception:  # sqlite3's or sqlcipher3's IntegrityError: the meeting was deleted?
         if app.repo.notes_source(session_id) is not None:
             raise
-        return CLOSE_GONE
-    room.broadcast("bytes", frame, skip=member)
-    if edit:
-        _announce_edit(app, session_id, member.name, member)
-    _schedule_fold(app, room)
+        raise FramesRefused(CLOSE_GONE, "The meeting is gone") from None
+    _on_loop(
+        app, _after_frames, app, session_id, list(zip(seqs, frames, strict=True)), author, skip
+    )
+    if author_id.startswith("p:"):  # maybe mine on a meeting shared with me: send it back
+        from . import share_push
+
+        share_push.notes_typed(app, session_id)
+    return seqs
+
+
+def _after_frames(
+    app: AppContext,
+    session_id: str,
+    logged: list[tuple[int, bytes]],
+    author: str,
+    skip: Member | None,
+) -> None:
+    """On the event loop (or, with none known, the calling thread): relay logged frames,
+    announce the edit, schedule the fold."""
+    _deliver(app, session_id, logged, skip)
+    if any(f[0] == DELTA for _, f in logged):
+        _announce_edit(app, session_id, author, skip)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:  # no event loop known to the hub: nobody is connected, fold now
+        fold_blocking(app, session_id)
+        return
+    room = hub(app).rooms.get(session_id)
+    if room is not None:
+        _schedule_fold(app, room)
+    else:
+        _spawn(app, fold_now(app, session_id))
+
+
+def receive_frame(app: AppContext, session_id: str, member: Member, frame: bytes) -> int | None:
+    """A frame from a member: logged and relayed (`accept_frames`). None, or the close code
+    it is refused with."""
+    if not member.can_edit:
+        return CLOSE_READ_ONLY
+    if hub(app).rooms.get(session_id) is None:
+        return CLOSE_BAD_FRAME
+    try:
+        accept_frames(app, session_id, [frame], member.id, member.name, skip=member, can_edit=True)
+    except FramesRefused as e:
+        return e.code
     return None
 
 
 def receive_text(app: AppContext, session_id: str, member: Member, text: str) -> None:
-    """A JSON message from a member: `{"type":"presence","typing":bool}` or a ping."""
+    """A JSON message from a member: `{"type":"presence","typing"?:bool,"sel"?:{"a","f"}|null}`
+    or a ping. `typing` counts from members that can edit, `sel` from every member (a malformed
+    one is ignored); neither is stored or logged."""
     try:
         msg = json.loads(text)
     except ValueError:
@@ -762,14 +1072,20 @@ def receive_text(app: AppContext, session_id: str, member: Member, text: str) ->
     if msg.get("type") == "ping":
         member.send("json", {"type": "pong"})
         return
-    if msg.get("type") != "presence" or not member.can_edit:
+    if msg.get("type") != "presence" or member.hidden:
         return
-    typing = bool(msg.get("typing"))
     room = hub(app).rooms.get(session_id)
-    if room is None or member.typing == typing:
+    if room is None or member not in room.members:
         return
-    member.typing = typing
-    room.broadcast("json", _presence(room), skip=member)
+    if "sel" in msg:
+        ok, sel = _clean_sel(msg["sel"])
+        if ok:
+            _move_caret(room, member, sel)
+    if member.can_edit and "typing" in msg:
+        typing = bool(msg["typing"])
+        if member.typing != typing:
+            member.typing = typing
+            room.broadcast_presence(_presence(room), skip=member)
 
 
 async def leave(
@@ -790,10 +1106,26 @@ async def leave(
     if room is None or member not in room.members:
         return
     room.members.remove(member)
-    if room.members:
-        room.broadcast("json", _presence(room))
+    _after_departure(app, room, member)
+
+
+def _after_departure(app: AppContext, room: Room, gone: Member) -> None:
+    """`gone` was removed from `room`. The room empty: it is dropped and the notes folded. Else
+    the visible members hear the new presence; and when the last visible member went, only
+    taps (hidden members) are left and the notes are folded too, as nobody is editing now.
+    A tap going while others stay changes nothing."""
+    if gone.caret_timer is not None:
+        gone.caret_timer.cancel()
+        gone.caret_timer = None
+    if not room.members:
+        if room.fold_timer is not None:
+            room.fold_timer.cancel()
+        del hub(app).rooms[room.session_id]
+        _spawn(app, fold_now(app, room.session_id))
         return
-    if room.fold_timer is not None:
-        room.fold_timer.cancel()
-    del hub(app).rooms[session_id]
-    _spawn(app, fold_now(app, session_id))
+    if gone.hidden:
+        return
+    room.broadcast_presence(_presence(room))  # only taps may be left: they drop its carets
+    if any(not m.hidden for m in room.members):
+        return
+    _spawn(app, fold_now(app, room.session_id))

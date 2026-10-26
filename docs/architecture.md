@@ -368,6 +368,81 @@ keeping its quote. Comments travel with library sync (merged by id with the rest
 searchable, show in the meeting's history, and publish `comments` events. Tasks and decisions
 show the threads of all their mentions.
 
+### Sharing with people (phase 8)
+
+Meetings can be shared with other people's computers (docs/plans/2026-10-23-phase-8-tasks.md).
+Each library has one person key (Ed25519, `services/person.py`); two people pair with a contact
+invite and trade signed cards (name and machine tickets) plus one shared random secret. Each
+derives the CONTACT tokens from it (HMAC per direction), stored as CONTACT devices in
+`services/pairing.py`, one per endpoint on the other's card; contacts live in the `contacts`
+table and travel in library sync. The owner's computers are the hub: `peer_shares` says which
+parts of a meeting a contact gets, and `GET /api/share/changes` builds a `SharedMeeting`
+(`services/shares.py`) carrying only those parts, signed with the owner's key. The recipient's
+`SharePuller` pulls these over the iroh tunnel (the link sidecar connects to the backend from
+127.0.0.2, so auth can tell tunnelled calls from local ones), verifies the signature and writes
+the copy with `apply_shared` (`sessions.shared_from`, read-only except comments, ticks and live
+notes). What the recipient does goes back as signed contributions to `/api/share/contributions`
+(`services/share_push.py`: a `share_outbox` row per comment write or tick, typed notes frames read
+off the notes log past a per-meeting cursor; pushed shortly after a write and before each pull
+round, idempotent by record id); the hub checks the signature, the contact's share and its parts before applying anything. Audio
+never travels. Demo mode seeds a contact and a shared meeting (`services/share_demo.py`).
+
+### Publishing
+
+A curated, encrypted copy of a meeting that anyone with a link can read (phase 7; use in
+[publishing.md](publishing.md)). Flow:
+
+```
+Publish dialog (PublishDialog.svelte, stores/publishing.svelte.ts)
+  ├─ POST …/publication/preview   publishing.preview: the unsealed manifest, drawn by the viewer's own Meeting.svelte
+  └─ PUT  …/publication           `publish` job (services/publishing.py)
+        build_content (selection, names, redaction; never the transcript)
+        → clips cut from the audio (reused when their span is unchanged)
+        → seal (publication_format.py: manifest + clip blobs, AES-GCM)
+        → host: PUT blobs then manifest to publish-host   |  here: <data_dir>/publications/<id>/
+        → `publications` row, history line, records seal
+  └─ POST …/publication/file      `publication_file` job: single.html with the sealed copy inlined
+
+Reader: https://<host>/p/<id>#<key>
+  → GET /p/<id>            viewer index.html (strict CSP; the backend or the publish host)
+  → GET /p/assets/…        the viewer's JS and CSS
+  → GET /pub/<id>          sealed manifest (ETag, X-Pub-Version, X-Pub-Expires)
+  → GET /pub/<id>/<sha>    sealed clips, immutable
+  → WebCrypto decrypts with the fragment's key, which no request carries; clips become blob: URLs
+```
+
+Format rules (services/publication_format.py; the reader is viewer/src/format.ts):
+
+- One random 32-byte key per publication, shown only in the link fragment (base64url, 43 chars);
+  never in `meta.json`, never in logs, never sent to a host. Ids are 16 random hex characters, not
+  the session id. Versions reuse the key, so an update keeps the link.
+- The manifest is canonical JSON padded to a multiple of 4 KiB (4-byte length, zero padding); a clip
+  is Ogg Opus padded to 64 KiB. Blob = nonce(12) || AES-256-GCM ciphertext || tag. AAD =
+  `mnemosyne/pub/1|<id>|<manifest|clip>|<version>`; a clip's version is the first one that uploaded
+  it, so later versions can reuse it. A blob's address is the SHA-256 of the whole blob.
+- Caps on padded size: manifest 1 MiB, a clip and all clips together 20 MiB.
+- A password-protected file derives the key with PBKDF2-HMAC-SHA256 (random salt in the file).
+- The manifest has no transcript field at all; quotes are the only transcript text
+  (`tests/test_publishing.py` asserts it). Clips are not redacted.
+
+Storage and serving:
+
+- `<data_dir>/publications/<id>/{meta.json, manifest, blobs/<sha>}` is the local copy. `meta.json`
+  is all `/pub` needs, so reading works while the library is locked; after an unpublish, expiry or
+  deletion it stays as a `gone` tombstone for 30 days (410 instead of 404).
+- The `publications` table holds the row (key and host token included; encrypted with the
+  database when encryption at rest is on), one live row per meeting. It travels in `SyncSession.publications`
+  (services/sync_publications.py; see the library sync rules, section 7).
+- The backend serves `/p/` and `/pub/` as open routes (api/routes/publishing.py), also on the team
+  listener, with the headers a publish host sends. The publish host (`publish-host/`, axum) is the
+  same read interface plus authenticated writes, caps, rate limits and mandatory expiry; it only
+  ever holds ciphertext. `deploy/publish/` runs it behind Caddy.
+- The viewer (`viewer/`) is its own Vite entry (Svelte 5, Tailwind, no SvelteKit, no wasm) built by
+  `pnpm build:viewer` into `backend/mnemosyne/api/static/viewer/` (`index.html`, `assets/`,
+  `single.html`), committed and rebuilt in CI, which fails when the output differs.
+- Where a link points: a host link uses `publish_host`; a "this computer" link uses the team
+  listener, else `phone_url` (`local_reach`); with neither, only 127.0.0.1 can open it.
+
 ### Live shared notes
 
 A meeting's notes are one hashseq document that everyone who has the meeting open edits live
@@ -431,6 +506,109 @@ Concurrent values stay live: `task` with `task_done` is done, otherwise the firs
 two link URLs render as plain text with "(link conflict)". Mark strings over 14 bytes travel as
 0xAF artifact frames. The markdown renderer is canonical and the parser covers what it renders
 (HTML and images stay literal), shared by the fold and the client's paste.
+
+### Guest notes (phase 9)
+
+A link that lets the people in a meeting type into its live notes from a browser (use in
+[guest-notes.md](guest-notes.md)). The notes keep their home in the backend's relay; a room on a
+publish host is only the meeting point.
+
+```
+guest page (guest/, WebCrypto, notes wasm)  <-- sealed frames -->  room on the host  <-->  Bridge (services/guest_notes.py)  <-->  /ws/notes relay
+https://<host>/n/<room>#<key>                                      /live/{room} (WebSocket)                                       shared_notes.py
+```
+
+- **The bridge** (`Bridge`, one asyncio task per live room, outbound WebSocket so NAT is no
+  problem). It is a hidden member of the notes room (`shared_notes.attach`); `_deliver` is where
+  every local frame ends (owner typing, copilot, phase 8 contributions, the server's comment
+  marks), so the bridge seals each one and sends it out with an empty gid and the owner's name.
+  Frames coming in are opened and fed to `shared_notes.accept_frames(..., skip=member)` as author
+  `guest:<gid>` / "<name> (guest)": logged, folded, relayed to editors, never echoed back. Frames
+  carry no author on the way out, so guests see the owner's side as the owner's.
+- **Comments.** The page mints a comment id and `notes_ids`; the bridge calls `comments.create`
+  with an explicit actor `("guest:<gid>", "<name> (guest)")` (guests edit and delete only their
+  own) and marks the text with `mark_comment`, so the mark belongs to the owner's server. After
+  each `comments` event the notes' threads are sealed back to the room.
+- **Snapshots and META.** The bridge folds the document (`fold_blocking` + `notes_catchup`) and
+  seals canonical JSON `{format, notes, frames, threads, meta}` with `PUT /live/{room}/snapshot`
+  and `X-Room-Since`, which prunes the host's log: at start, every 3 minutes while something
+  changed, and at the end. A META envelope `{title, date, owner, agenda:[{text, covered}], ended,
+  origin}` follows the `session` and `copilot_notes` events (`AgendaItem.covered`). The notes
+  document's origin travels in SNAPSHOT and META because a browser cannot list a seq's objects.
+- **The room** (`publish-host/src/rooms.rs`, routes and WebSocket in `live.rs`). The publisher
+  token (plus the upload token on a closed host) creates, snapshots, ends and deletes a room over
+  HTTP. A guest joins over WebSocket with `room_token`; the host stores only its hash and compares
+  in constant time. After `welcome` it replays the snapshot and the log since `since`, then relays
+  `0x01 || seq || envelope`, presence (`0x02`), snapshots (`0x03`), a connection `count` and
+  `ended`. Caps: frame 2 MiB + 1 KiB, log 8 MiB, snapshot 8 MiB, 64 connections, rooms at most 7
+  days, an ended room readable 24 h. The log is `seq u64 || len u32 || bytes` on disk. Acks come
+  back through the relay, so the owner's `since` never skips a frame.
+- **Format** (`services/guest_format.py`, mirrored by `guest/src/format.ts`). `frames_key =
+  HKDF(key, "mnemosyne/guest/frames")`; `room_token = b64url(HKDF(key, "mnemosyne/guest/room"))`.
+  Envelope `kind(1) || nonce(12) || AES-GCM(pad(plaintext))`, AAD `mnemosyne/guest/1|<room>|<kind>`;
+  kinds notes=1, snapshot=2, comment=3, meta=4, presence=5. A notes plaintext is `u8 len gid ||
+  gid || u8 len name || name || raw frame`. `backend/tests/vectors/guest_v1.json` is checked by
+  Python, TypeScript and (the room token) Rust; a format change means bumping the version byte in
+  the AAD.
+- **The guest page** is its own Vite entry (`guest/`, Svelte 5, base `/n/`) built into
+  `backend/mnemosyne/api/static/guest`, committed and diffed by CI like the viewer. Unlike the
+  viewer it needs the notes wasm (committed bytes, emitted as an asset) and reuses
+  `src/lib/notes` (`createEditorView`, `attachInput`, `UndoStack`, comments) with its own
+  `guest/src/doc.ts` on `sync.ts` instead of the app's stores. The page connects before asking
+  for a name so the consent line can name the owner, and keeps a mirror of what the room logged
+  to resume after a reconnect. CSP: `script-src 'self' 'wasm-unsafe-eval'`, `connect-src 'self'`.
+  Served at `/n/{room}` by the host (`PUBLISH_GUEST_DIR`) and the backend (`/n/` is an open
+  path), both with `wasm -> application/wasm`.
+- **Lifecycle** (`api/routes/guest_notes.py`, rows in `guest_rooms`). One room per meeting; start,
+  end, New link and stop write history lines and seal records (`EVENT_SEALS`). Auto-end runs
+  `guest_notes_end_hours` after `recording_stopped`, is cleared when a new part starts and never
+  fires while recording. Deleting a meeting deletes its room. The host comes from `guest_host`,
+  else `publish_host`, else `OUR_GUEST_HOST` (empty until our host runs); none gives 409. Team
+  servers need `allow_guest_notes`.
+
+**Phase 10: no host to run.** Guest notes work without a publish host (use and limits in
+[guest-notes.md](guest-notes.md)). The rooms sidecar (`mnemosyne-link rooms`, run on demand by
+`RoomsLink` in services/link.py, independent of remote access) embeds the publish host on a loopback
+port and opens one guest iroh endpoint per room (own key in `<data_dir>/guest_rooms/keys`, never the
+remote-access id; ALPN `mnemosyne/guest/1`). Each guest is one framed bidirectional stream
+(`u32 length || tag || payload`, up to a full snapshot, 8 MiB + 64 KiB) proxied to the loopback
+`/live/{room}` WebSocket, close codes becoming QUIC application closes. The Bridge is unchanged
+against it: it speaks to the loopback host as to any publish host. With a configured publish host a
+second Bridge mirrors the same room (same id and key) there. `guest_transport` (`plan` in
+services/guest_notes.py) picks auto = iroh, else tunnel, else host. A tunnel (services/tunnel.py:
+Tailscale Funnel, else a `cloudflared` quick tunnel) sits in front of the same loopback host, so it
+needs no second room. In the browser, guest-wasm (iroh compiled to wasm, relay-only, built by CI and
+committed as `guest/pkg`) gives `IrohSocket` behind the page's one socket interface, tried first
+(about 8 s) before the host's wss, with a `since` per transport. Link format 2 is
+`#2.<room>.<key>.<endpoint>.<relay host>`; format 1 links still work. The page is served from GitHub
+Pages and keeps the last sealed snapshot in IndexedDB until the link expires.
+
+**Phase 11: the notes editor, live** (use in [guest-notes.md](guest-notes.md); build order in
+docs/plans/2026-10-25-phase-11-tasks.md). Presence is one path both ways, none of it stored. A client
+sends `{"type":"presence","typing"?,"sel"?}` over `/ws/notes`; `shared_notes.py` keeps `typing` and `sel`
+(anchor and focus as element ids, not offsets, so remote edits do not move a caret) on the in-memory `Member`
+and sends `presence` (with `members`) and coalesced `caret` messages (one per 100 ms per member, the last
+position always arrives). The bridge is a hidden member with `presence_tap`: it also hears `presence` and `caret`,
+and seals each owner-side member to the room as PRESENCE gid `o:<member key>` beside the `""` owner heartbeat. A
+guest's PRESENCE (`sel`, `gone`) comes back through `Bridge._on_presence` as `guests` (who is there or typing) and
+`guest_caret` (only a selection moved) to the editors, and is forwarded byte for byte into the meeting's other
+rooms, so guests on the iroh room and on a host mirror see each other (the publish host has its own presence
+channel with a cap of 10 per second). The carets are drawn by `src/lib/notes/ui/CaretOverlay.svelte`;
+`src/lib/app/notesPresence.ts` and `guest/src/presence.ts` are the two providers.
+
+Chips are `link` marks, not a new mark kind: `[12:34](mnemosyne:t/<part>/<seconds>)`, `mnemosyne:person/<name>`,
+`mnemosyne:meeting/<id>` (src/lib/notes/chips.ts `parseChip`; services/notes_chips.py is the strict Python twin).
+Everything outside the editor reads text (`plain_notes`, `obsidian_notes`), and combining meetings retargets time
+chips. The recording's place on the timeline is the `clock` (`{part, offset, started_at}`, services/parts.py
+`recording_clock`) on the start and active-recording responses and in the guests' META.
+
+Notes items (services/notes_items.py): a task line with a person chip is an action item. `Session.notes_items`
+is derived at each place a fold result is stored (the sidecar answers with `tasks` for every request), so
+nothing keeps a second copy in step; state that is not in the line (`follow`, `due`, `issue_url`, `task_id`) is
+carried over by line id, or by text and owner when `set_text` gave a line a new id. They are task objects like
+summary items. A tick made outside the editor is written into the document with the sidecar's `set_kind`, which
+produces ordinary frames for the connected editors. The editor UI shared by the app and the guest page
+(`src/lib/notes/ui/`: `NotesEditor`, the `/` menu, toolbars, touch bar) imports only `src/lib/notes`.
 
 ## Backend Lifecycle
 

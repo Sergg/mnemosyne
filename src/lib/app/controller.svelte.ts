@@ -23,12 +23,14 @@ import { autoRecordState, type AutoMode } from '$lib/stores/autorecord.svelte.js
 import { commentsState } from '$lib/stores/comments.svelte.js';
 import { calendarState } from '$lib/stores/calendar.svelte.js';
 import { connectionState, SAME_ORIGIN } from '$lib/stores/connection.svelte.js';
+import { guestNotesState } from '$lib/stores/guestNotes.svelte.js';
 import { jobsState } from '$lib/stores/jobs.svelte.js';
 import { sessionState } from '$lib/stores/session.svelte.js';
 import { toastState } from '$lib/stores/toast.svelte.js';
 import { teamState } from '$lib/stores/team.svelte.js';
 import { transcriptState } from '$lib/stores/transcript.svelte.js';
 import { uiState, type ShellStage, type View } from '$lib/stores/ui.svelte.js';
+import { contactsState } from '$lib/stores/contacts.svelte.js';
 import { syncState } from '$lib/stores/sync.svelte.js';
 import { updateState } from '$lib/stores/update.svelte.js';
 import { wsState } from '$lib/stores/websocket.svelte.js';
@@ -67,7 +69,8 @@ export async function startRecording(fresh = false, consent?: Consent) {
   }
   audioState.pending = 'starting'; // at once, before the session exists
   try {
-    if (fresh || !sessionState.activeSession) {
+    // A meeting shared with me is someone else's: never record into it, start a new one.
+    if (fresh || !sessionState.activeSession || sessionState.activeSession.shared_from) {
       await sessionState.createSession();
     }
     if (!sessionState.activeSession) return;
@@ -607,6 +610,7 @@ function onConnected(): () => void {
   sessionState.loadSessions();
   wsState.connect();
   void syncState.load();
+  if (!connectionState.me?.team_mode) void contactsState.load();
   transcriptState.init();
   void resumeActiveRecording();
   jobsState.init();
@@ -702,12 +706,26 @@ function onConnected(): () => void {
       }
       return;
     }
+    if (msg.type === 'share_pull') {
+      contactsState.applyPull(msg);
+      return;
+    }
+    if (msg.type === 'share_outbox') {
+      if (sessionState.activeSession?.id === msg.session_id) void contactsState.loadStatus(msg.session_id);
+      return;
+    }
     if (msg.type === 'shares') {
       // Some meeting was shared or unshared: what this person may see may have changed.
       sessionState.loadSessions();
       return;
     }
+    if (msg.type === 'history') {
+      // The history event has no kind: reload the room only for a meeting whose room is shown.
+      if (guestNotesState.watching(msg.session_id)) void guestNotesState.load(msg.session_id);
+      return;
+    }
     if (msg.type !== 'session') return;
+    if (guestNotesState.watching(msg.session_id)) void guestNotesState.load(msg.session_id);
     sessionState.loadSessions();
     // Keep the open session's status (footer, badges) in step without a refetch.
     const active = sessionState.activeSession;

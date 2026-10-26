@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { focusOnMount } from '$lib/app/focus.js';
 	import { combineSessions, getJob, importAudio } from '$lib/api/backend.js';
-	import { syncState } from '$lib/stores/sync.svelte.js';
+	import { audioReason } from '$lib/app/access.js';
+	import { publishingState } from '$lib/stores/publishing.svelte.js';
 	import { audioState } from '$lib/stores/audio.svelte.js';
 	import { sessionState } from '$lib/stores/session.svelte.js';
 	import { toastState } from '$lib/stores/toast.svelte.js';
@@ -16,7 +17,7 @@
 	let busy = $state(false);
 
 	const session = $derived(sessionState.activeSession);
-	const foreignReason = $derived(session?.origin ? syncState.audioOn(session.origin) : '');
+	const foreignReason = $derived(audioReason(session));
 	const recordingHere = $derived(audioState.isRecording && audioState.activeSessionId === session?.id);
 
 	// The other meetings with audio, closest in time first: the other half of a dropped call is
@@ -147,6 +148,19 @@
 				Combine with another meeting…
 				<span class="block text-xs text-gray-500">E.g. a call that dropped and was recorded again</span>
 			</button>
+			{#if publishingState.allowed}
+				<button
+					role="menuitem"
+					class="block w-full px-3 py-1.5 text-left text-gray-200 hover:bg-gray-800"
+					onclick={() => {
+						open = false;
+						if (session) publishingState.open(session);
+					}}
+				>
+					Publish…
+					<span class="block text-xs text-gray-500">A copy others can read, with a link or as a file</span>
+				</button>
+			{/if}
 		</div>
 	{/if}
 </span>

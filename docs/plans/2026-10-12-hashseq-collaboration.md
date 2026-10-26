@@ -490,6 +490,537 @@ Drafted against the code at 273eaf3 (hashseq 94f5e3c), reviewed and accepted.
   TestClient websockets for the relay, two-app sync tests, a Playwright two-page convergence spec
   in Chromium and WebKit (the e2e job builds link).
 
+## Phase 7: publishing a meeting
+
+### Phase 7 design (agreed with Corey 2026-10-23)
+
+Status: built 2026-10-23, unreleased, as designed below (use: docs/publishing.md; flow:
+docs/architecture.md "Publishing"). Found while building: emails and phone numbers are hidden next to
+identifiers (`redact_contacts`, same `hide_identifiers` switch), since a summary names them as often as
+account numbers; `local_reach` (team / phone_url / this_device), because a desktop's link to itself only
+reaches others through the team listener, so the dialog and `Publication` say who can open it; the
+`publications.origin` column says which computer serves a "this computer" publication (library sync);
+two computers publishing the same version of a hosted publication are told apart by the manifest ETag (the
+host's 409 with our version is success only when it holds our manifest); records seals are forced for
+publish events (`add_seal` deduped them away when nothing else had changed); diarizer labels
+(SPEAKER_01) are never published as owners or speakers; files are saved through the Tauri save dialog and
+a loopback-only endpoint (`POST …/publication/file/{token}/save`), since a webview cannot download them;
+viewer assets live under `/p/assets` so the same build works at `/p/<id>` on the backend and on the
+publish host.
+
+Drafted against the code at 6020e3a (0.21.0), reviewed and accepted. It uses neither hashseq nor
+Logos: readers never write, and a curated copy must be able to lose a sentence for good.
+
+- **A curated projection, never the record.** The owner (or an admin) picks parts in a Publish
+  dialog with a live preview rendered by the viewer itself: title, date, summary, decisions, open
+  questions, action items, chapters, attendees and topics on by default; quotes (with clips,
+  chosen one by one) and the live notes off by default; the transcript never (only quote lines;
+  a test asserts no segments). Identifiers redacted by default (`redact_identifiers`); names as
+  they are by default (Corey), or first names, or Person 1 (`Redactor`). Clips cannot be
+  redacted: the dialog plays each chosen clip ("listen before you publish").
+- **Format: an encrypted snapshot per version** (Corey), not a hashseq space: a padded JSON
+  manifest plus Ogg Opus clip blobs (content-addressed by ciphertext SHA-256, reused across
+  versions), AES-256-GCM with AAD `"mnemosyne/pub/1" ‖ id ‖ kind ‖ version`. One random key per
+  publication; versions reuse it so the link stays the same. Caps: manifest 1 MB, clips 20 MB.
+- **The capability link**: `https://<host>/p/<id>#<key>` (id 16 random hex, never the session
+  id). The fragment never leaves the browser. The host sees ids, padded sizes, times, readers'
+  IPs; no text. Unpublish deletes the blobs (copies already opened cannot be revoked; the docs say
+  so). Expiry: hosted links 90 days by default, at most 365 on our host; files never expire.
+- **Where** (Corey: local + file now, host built): "this computer" (the backend serves `/p/{id}`
+  and `/pub/...` read-only, open paths; the team server too, always on), "a file" (one HTML with
+  the viewer and the ciphertext inlined, optional password via PBKDF2), and "our publish host"
+  (`publish-host/` axum crate + `deploy/publish/`, ciphertext only, caps, rate limits, mandatory
+  expiry; `publish_host` blank until one runs, then the default, as with relays). Logos
+  (storage_module/delivery_module are C++ plugins in a Logos Core host; Basecamp spaces are
+  unofficial) is a written trial only.
+- **The viewer**: its own Vite entry (`viewer/`, Svelte 5, no SvelteKit router or app stores, no
+  wasm), WebCrypto in the browser, clips as blob URLs, strict CSP, works from `file://`; built
+  reproducibly into backend static files and `single.html`, checked in CI like the notes wasm.
+- **Management**: `publications` table (one live publication per meeting), Update keeps the link,
+  "published version is behind" after re-summarizing, history lines (`published`,
+  `publication_updated`, `unpublished`), each publish sealed into the meeting's records
+  (`publications.json` in the records zip, never the key). Team servers: `allow_publishing` off
+  until an admin turns it on (Corey); then owner or admin. Readers see that a meeting is
+  published, not the link.
+- **Sync**: the publication row (key included) travels in `SyncSession.publications`; hosted
+  publications can be updated from either machine (clips only from the origin); one served by
+  "this computer" is served by its origin only.
+
+## Phase 8: sharing with other people's computers
+
+### Phase 8 design (drafted 2026-10-23, for review)
+
+Status: built 2026-10-24, unreleased, as designed below with the corrections in
+docs/plans/2026-10-23-phase-8-tasks.md (contact tokens derived from a per-pair secret, a card
+passthrough in the sidecar, tunnelled TCP from 127.0.0.2, the hub enforcing team mode's own rules
+through a contact Principal). The UI lives in Settings → General ("People you share with"), the
+meeting header's Share menu and the sidebar's "Shared with me". Not yet: a real two-person check
+through the sidecar (tests use in-process apps and the fake sidecar).
+Drafted against the code at 20117be. Decided by Corey (2026-10-23):
+the owner picks what each share contains; recipients get team-share parity (comment, tick and
+follow tasks, edit the live notes); the owner's machines are the hub; one key per person.
+
+The team server shares meetings from one central copy. This shares them between desktops with no
+server: each recipient's machine holds the meetings shared with it. It is the first phase where
+peers are different people, so it is also where prerequisite 2 (authorship) gets built.
+
+What exists today and does not carry over: library sync trusts a peer completely (a DESKTOP token
+opens the whole API, `apply_synced` skips every access check, every meeting is offered, and
+publication keys travel), because every peer is the same person. Authors are text labels
+(`author`, `author_id`, history `by`) that any writer can set. The only key is the iroh endpoint
+key in `link.key`. A sync peer's id is a random string it states about itself, tied to its
+endpoint only by the pairing flow.
+
+- **A key per person.** An Ed25519 signing key, made in Python with `cryptography` (already a
+  dependency), stored as `<data_dir>/person.key` sealed with the files key (storage/crypto.py),
+  so a locked app cannot sign. The person id is the public key; people compare an 8-group
+  fingerprint when pairing. The display name is self-stated, and a contact can rename it locally.
+  Library-sync pairing copies the key to your other machines (one more call over the tunnel,
+  token-gated). If both machines already have different keys, the one with no contacts or shares
+  adopts the other's; if both have them, pairing is refused ("these computers belong to different
+  people"). A lost machine means a new key: rotate it, and contacts re-pair (no revocation list
+  in v1).
+- **Contacts.** A new invite kind `contact` (services/pairing.py), the same `<ticket>#<code>`
+  string sent any way you like. Redeeming it swaps signed cards `{person key, name, endpoint ids
+  of all that person's machines, at}`. Each side stores the other in a `contacts` table, which
+  travels in library sync. Every endpoint on the card becomes a paired device of a new kind
+  CONTACT. Its token opens only `/api/share/*`, scoped in auth.py the way PHONE tokens are; the
+  sidecar needs no change, because its `T` stream already admits paired endpoints only. A re-signed
+  card (a new machine, a new name) is pushed to contacts and replaces the old one only when it
+  verifies against the stored key.
+- **Shares.** `peer_shares(session_id, contact_id, parts, transcript, by, at, revoked_at)`; it
+  travels in library sync, so any of the owner's machines can serve it. The dialog reuses the
+  Publish dialog's part picker. On by default: title, date, summary, decisions, open questions,
+  action items, chapters, topics, attendees and notes. The transcript is a tick, off by default,
+  that warns it cannot be taken back once sent. Names come as they are, with an optional "hide
+  identifiers" (publishing's `redact_identifiers` + `redact_contacts`). Never shared: audio,
+  clips, recordings paths, speaker embeddings, voice profiles, publications (keys included),
+  seals, versions, supervision and other people's shares. Recipients see the names of the others a
+  meeting is shared with, since those people's comments and notes edits are visible to them.
+- **What a recipient gets: a `SharedMeeting`** (models/shared_meeting.py), the projection of one
+  share. It holds the chosen parts, comments, item done/follow state, the notes document snapshot
+  when notes are shared, and `version`. It is signed by the owner's person key. Nothing outside
+  the chosen parts is ever serialized. The notes part carries its whole op history, so anything
+  ever typed in the notes goes with it; the dialog says so next to the tick.
+- **The hub.** The recipient's backend pulls from any of the owner's machines it can reach, using
+  `GET /api/share/changes?since=` through the tunnel with its contact token. That returns signed
+  `SharedMeeting` documents for the meetings shared with that contact, oldest change first, plus
+  tombstones for unshares and deletes. The recipient pushes its own work with
+  `POST /api/share/contributions`. That is a batch of signed records `{id, kind, session_id,
+  payload, author key, at}`, signed over canonical JSON; for notes, the payload is the frame's
+  SHA-256 and the frame travels beside it. Record kinds: `comment` (create, edit, delete,
+  resolve), `item_flag` (done or follow by item id) and `notes_frames` (0xDE / 0xAF frames).
+  `POST /api/share/poke` asks for an immediate pull in either direction, so live notes typed on
+  a recipient reach the owner's open editors within seconds while both are online. Edits made
+  offline queue on the recipient ("2 comments waiting for Corey's computer") and are pushed on the
+  next connection.
+- **The owner's machine checks every record before it is written.** The signature must verify.
+  The signer must be the contact bound to the endpoint the request came through; in hub mode,
+  nobody forwards someone else's records. The share must be live and include the part. The rule
+  must allow it: anyone shared with comments and ticks; notes edits only when notes are shared;
+  edit or delete only your own comments; resolve as the thread author. Accepted records go
+  through the normal write paths (comments service, `_set_action_item_flag`, the notes relay's
+  `receive_frame`) with author = the contact's name and `author_id = "p:<first 16 hex of key>"`.
+  They log history lines, notify open clients, travel on to the owner's other machines in library
+  sync, and are served back to every recipient. Rejected records come back with a reason, which
+  the recipient shows on the item. Records are idempotent by id.
+- **Signatures are kept.** A table `signatures(subject, signer, sig, at)` stores records by id and
+  notes frames by hash, on the owner's machines and the recipients'. Records, history and per-frame
+  authorship can then be checked later, and a future mesh has something to filter on. Because the
+  hub refuses a bad frame before it reaches the log, no op is ever orphaned: v1 signs frames, not
+  op ids. Signing op ids, and dropping unsigned ops when rendering, is what a mesh would need
+  (Later).
+- **On the recipient's side.** A shared meeting is a `sessions` row with
+  `shared_from = <contact id>` and a sidebar group "Shared with me". The header shows "Shared by
+  <name>". `canChange` is false except for the allowed writes, and no automation runs (there is no
+  audio). Keyword search covers these meetings. They are left out of Ask and semantic search, the
+  digest and Obsidian export unless a setting turns each on (all off by default; open question).
+  Tasks owned by you (`mine_matcher`) appear in your Tasks view. Shared meetings do not travel in
+  library sync: each of your machines is on your card, so each one pulls them from the owner.
+- **Unshare, delete, remove a contact.** Each one becomes a tombstone on the next pull. The
+  recipient's app deletes its copy and says why. This only works with a cooperating app, and the
+  dialog says copies cannot be recalled, as for publications. Removing a contact revokes all
+  their shares and drops their CONTACT devices.
+- **Refused in team mode** on both sides, like library sync. The team server stays the central
+  option.
+- **Hardening first** (found while mapping, independent of the rest): bind `SyncPeer.id` to its
+  endpoint id and refuse a hello from another endpoint; keep `SyncSession.publications` between
+  one person's machines only, so it never goes into any share; contact tokens can never reach
+  `/api/sync/*`.
+- **UI.** Settings → People (contacts: add by invite, compare fingerprints, rename, remove; your
+  own fingerprint and name). ShareMenu gets a "People" section that opens the part picker for each
+  person. Sidebar "Shared with me". On the recipient: a header chip and a "waiting for <owner>"
+  line on queued work. On the owner: a "from <name>" byline on contributed comments and notes
+  edits.
+- **Prerequisites.** Privacy (1): iroh is end-to-end encrypted between paired peers, content is
+  chosen per share, and the transcript is off by default; notes ops stay permanent, and the dialog
+  says so. Authorship (2): person keys plus signed records and frames, enforced at the hub;
+  op-level signing waits for a mesh. QUEUE 56 (3): avoided (no nested objects). Format (4): met.
+- **Tests.** Three in-process apps (owner, recipient A, recipient B) through
+  `httpx.ASGITransport`, like test_sync_*.py. Cover: the share projection never holds unchosen
+  parts (a test asserts there is no transcript when it is unticked); contact tokens are refused
+  outside `/api/share/*`; tampered, replayed and forwarded records are refused; notes frames from
+  A reach B through the owner; unshare deletes on the recipient; key adoption at library-sync
+  pairing; the hardening items.
+- **Not in v1:** a mesh, so nothing reaches recipients while every owner machine is offline;
+  presence across machines; audio and clips; resharing; recipients editing the summary or
+  transcript; recalling copies; per-device keys.
+
+Open for Corey: whether shared-with-me meetings join Ask, semantic search, the digest and Obsidian
+export by default; the name in the UI ("People", "Contacts" or "Share with a person"); whether to
+ship the hardening items on their own first.
+
+## Phase 9: guest notes (a link for the people in the meeting)
+
+### Phase 9 design (drafted 2026-10-24, for review)
+
+Status: built 2026-10-24, unreleased, as designed with the corrections in
+docs/plans/2026-10-24-phase-9-tasks.md. Drafted against the code at 0e00520 (0.23.0). Decided by Corey
+(2026-10-24): rooms on the publish host you run and, by default, on a public one we run; guests
+see the notes and the agenda; after the meeting the page turns read-only until the room expires;
+guests may comment on the notes in v1.
+
+Why: most meetings are with people outside one's organization. Phase 8 needs the other person to
+run Mnemosyne and pair; a team server needs an account, a way to reach the host and a team mode
+that turns phase 8 off; publishing is read-only and after the fact. Nothing lets the people you are
+talking to type into the meeting's notes from a browser. Phase 9 does: during a meeting you hand
+out a link, and anyone holding it types into the live notes, with no install, account or pairing.
+
+- **A capability link per meeting**, like publishing's: `https://<host>/n/<room>#<key>`. `room` is
+  16 random hex (never the meeting id); `key` is 32 random bytes that only the fragment carries,
+  so the host never sees it. The link opens the live notes, the comments on them, and read-only:
+  the meeting's title, date, the owner's name and the agenda (Corey: notes and agenda). The
+  agenda is the calendar event's description the copilot follows, with the items it marked
+  covered (`agenda_covered`) ticked as the meeting goes. Never the transcript, summary, audio or
+  comments on anything but the notes. One link per meeting at a time; **New link** makes a new
+  room and key and closes the old one.
+- **End-to-end encrypted frames.** Notes travel as today's hashseq frames (0xDE deltas, 0xAF
+  artifacts, phase 6), each sealed with AES-256-GCM under a key derived from `key` (HKDF
+  "mnemosyne/guest/frames"), AAD `mnemosyne/guest/1|room|kind`. Presence and names are sealed JSON
+  frames. Replays and reordering are harmless: the CRDT is idempotent. This is prerequisite 1's
+  "encrypt ops per document": the relay becomes a store-and-forward mailbox and cannot merge,
+  so all merging happens in the browsers and in the owner's app.
+- **The relay: a room on a host both sides can reach.** The owner's desktop is behind NAT, so
+  guests and owner meet at a relay. That is the publish host, which gains a live channel:
+  `GET /n/{room}` (the guest page), `wss://…/live/{room}` (relay sealed frames to everyone in the
+  room, keep a bounded log), `PUT /live/{room}` (create, with the publisher token as for
+  publications), `PUT /live/{room}/snapshot` and `DELETE /live/{room}`. A guest proves it holds the link
+  with `room_token = HKDF(key, "mnemosyne/guest/room")`. The owner registers it at creation, so the
+  host can refuse strangers without being able to read anything. Caps: frames ≤ 256 KB, log
+  ≤ 8 MB, rooms expire (default 24 h after the last frame, at most 7 days), rate limits as for
+  publications. The host sees room ids, sizes, times and guests' IPs. Which host (Corey: the
+  publish host you run, and ours by default): a `guest_host` setting; blank means our public host
+  once it runs (as for iroh relays, where ours is the fallback), and the publish host when you set
+  one. Ours is the same `publish-host` binary and deploy/publish/ setup, run by us, with its own
+  caps and a published privacy note. Until it runs, guest notes need a configured publish host and
+  the button says so. "This computer" as a relay (Tailscale Funnel, the team listener) is later.
+- **The owner's backend is the bridge.** Its relay (`/ws/notes`) stays the document's home. A
+  bridge task dials the room over an outbound WebSocket (works behind NAT), decrypts guests'
+  frames and feeds them in through `shared_notes.accept_frames` with author
+  `guest:<name>`. It seals every local frame (the owner's typing, the copilot's "Add to notes",
+  phase 8 contributions) and sends it out. It also posts a sealed folded snapshot every few
+  minutes, so a late guest loads one snapshot plus the log since. When the owner's app is offline,
+  guests keep typing together through the relay, and the bridge catches up from the log when it is
+  back. The fold, Obsidian, search and the summary keep reading `Session.notes` as today.
+- **The guest page:** a new Vite entry (`guest/`, Svelte 5, built reproducibly into the backend's
+  static files and the publish host like `viewer/`). Unlike the viewer, it needs the notes wasm and
+  the editor from `src/lib/notes`, so it reuses them as a library: no app stores, no SvelteKit
+  router. On first open: "Your name" (kept in the page's localStorage) and a consent line: "What
+  you type here becomes part of <owner>'s notes of this meeting." After that, the same editor
+  (formatting, tables, paste, undo of one's own edits), names of who is here and who is typing,
+  the agenda beside the notes, and a "Connecting… / Live / Ended" state. It works in Chromium,
+  Firefox and WebKit (Safari).
+- **Guests comment on the notes** (Corey: yes, in v1): select text, **💬 Comment**, as in the app.
+  A comment is a sealed JSON frame `{kind: comment, op, id, parent_id, quote, text, guest}`
+  relayed like the rest; the bridge writes it through the comments service (phase 5, target
+  `notes`) with author `guest:<name>`. The bridge also marks the text (`mark_comment` from
+  `notes_ids`), so the mark belongs to the owner's server, as for web readers in phase 6. It seals
+  every thread on the notes back to the room, the owner's and phase 8 people's included, so
+  everyone sees the same threads. Guests create and reply; edit and delete only their own, known by
+  a random `guest` id kept in the page's localStorage (as weak as the name). Resolving stays with
+  the owner. Comments on the notes do not leave the room otherwise.
+- **After the meeting** (Corey: read-only until expiry): **End guest notes**, or the automatic end
+  after the recording stops, posts a final sealed snapshot with the threads and an `ended` frame.
+  Open pages turn read-only, "Ended: you can still read and copy these notes until <time>". New
+  visitors see the same until the room expires (default 24 h after the end, at most 7 days),
+  then the host deletes the room. **New link** or **Stop sharing the notes** deletes it at once.
+- **Authorship, honestly.** A guest's name is what they typed. The bridge stamps their frames
+  `guest:<name>` in `shared_notes_ops`, which the owner's app shows ("from Ana (guest)"). In
+  v1 frames are not signed per guest; prerequisite 2 (signatures) is for people with keys, phase 8.
+  Holding the link is what lets someone write. The owner can cut everyone off at once with **End
+  guest notes** or **New link**. Text a guest typed stays in the notes' history, as all typing does
+  (phase 6).
+- **The owner's controls:** **Invite to notes** in the meeting header and on the recording
+  screen next to the Copilot (when no host is available: a note on what is missing), then
+  **Copy link** and a QR code. A line shows who is here. **End guest notes** turns the room
+  read-only (above); **Stop sharing the notes** deletes it. A meeting's guest notes also end N hours
+  after its recording stops (setting, default 12). Every start, end and deletion is a history
+  line, and is sealed into the meeting's records like a publish.
+- **Consent and team servers.** `require_consent` also reminds the owner that guests' typing
+  becomes part of the record. On a team server, guest links are off until an admin turns on
+  `allow_guest_notes`; then the owner or an admin may start one.
+- **What it reuses:** notes-core, notes-wasm and the editor (phase 6); the capability-link, sealing
+  and host pattern, caps, expiry, publisher token and records seals (phase 7); `accept_frames` and
+  `guest:` authors next to the `p:` ones (phase 8).
+- **Tests:** the bridge against a fake room in Python (sealed in, plain into the relay, and
+  back); the host's live routes in `cargo test` (auth by room token, caps, expiry, log replay);
+  the guest page's sealing in Vitest against shared test vectors (as `publication_v1.json` does
+  for publishing); the bridge writing guest comments as `guest:<name>` and marking them once; a
+  Playwright spec with two pages, the owner's app and a guest page, against a local publish host
+  started for the test: both type and converge, the guest comments and the owner sees the thread,
+  the agenda shows, End turns the guest page read-only and Stop sharing the notes closes it.
+- **Not in v1:** guests ticking action items or seeing the summary; per-guest revocation (only
+  end-all or a new link); "this computer" as a relay; a mesh without a relay (iroh in the browser
+  goes through relays anyway); keeping a guest's copy after the room expires (they can copy the
+  text while it is read-only).
+- **Before it ships:** our public host running (deploy/publish/ on our side, a privacy note
+  saying what it can see), and guest notes off by default until it does, unless a publish host is
+  set.
+
+## Phase 10: guest notes without a host to run
+
+### Phase 10 design (drafted 2026-10-25, for review)
+
+Status: built 2026-10-25, unreleased, with the corrections in docs/plans/2026-10-25-phase-10-tasks.md.
+Drafted against the code at 996a03d (0.24.0). Decided by Corey
+(2026-10-25): host from this computer (a tunnel) and a hosted relay as in the discussion after 0.24.0,
+and iroh straight to the owner's computer as the default; the guest page on GitHub Pages now; n0's
+relays, labelled as a testing relay, until ours runs; a Cloudflare quick tunnel as the automatic
+fallback (Funnel first when logged in), `cloudflared` downloaded on first use; guests' browsers keep
+a read-only copy until the link expires. The Logos alternative is a written trial only
+(`2026-10-25-logos-guest-notes-trial.md`).
+
+Why: in 0.24.0 guest notes need a publish host somebody runs on the internet. Most people will not
+run one, and ours does not exist yet. This phase makes guest notes work with nothing to set up, and
+keeps the publish host as the option for links that outlive the owner's computer.
+
+Three transports, one wire. Every transport carries the same thing as the phase 9 room: the join
+with the room token, sealed envelopes (`services/guest_format.py`), seq, acks, presence, end and
+the close codes 4401/4403/4409/4410/4413/4429. The guest page's `RoomClient` (guest/src/room.ts)
+gains a socket per transport behind one interface, so `GuestDoc` and the editor do not change.
+
+- **1. iroh to the owner's computer (the default).** The owner's `mnemosyne-link` sidecar becomes
+  the room.
+  * **Feasibility (checked 2026-10-25):** iroh 1.3, the version link/ already uses, builds for
+    `wasm32-unknown-unknown` with `default-features = false, features = ["tls-ring"]` and `getrandom`'s
+    `wasm_js` backend (iroh's `wasm_browser` cfg; its CI runs a wasm connect-and-echo test; n0's
+    browser-echo example is the template). In a browser it is relay-only: the endpoint dials
+    `wss://<relay>/relay`, QUIC runs over the relay, `connect` and bi streams work against a native
+    endpoint. Any iroh-relay 1.x accepts browsers (no Origin check); it needs a TLS certificate from a
+    public CA, which deploy/relay/ already has (Let's Encrypt). No UDP, hole punching, mDNS or DNS
+    lookups in the browser.
+  * **Desktop side:** a **separate guest endpoint** in the sidecar, one random key per room (never
+    link.key, so guests never learn the stable remote-access id), accepting only ALPN
+    `mnemosyne/guest/1`. The `T` (backend tunnel) and `P` (pairing) streams are not reachable from
+    it at all. Each guest connection is one bi stream carrying the phase 9 wire as length-prefixed
+    frames (u32 length, a text/binary tag, the payload); close codes become an app close of the
+    QUIC connection. The room logic is `publish-host/src/rooms.rs` (already a library crate)
+    embedded in the sidecar: the same seq, log, snapshot, end, caps and acks-through-the-relay, kept
+    in memory and on disk under `<data_dir>/guest_rooms/`. The bridge (services/guest_notes.py) talks
+    to it over a loopback WebSocket with the same protocol it already speaks to a publish host, so
+    the backend changes little: a room's `host_url` is `ws://127.0.0.1:<port>` plus an `iroh` flag.
+  * **The guest page:** a new `guest-wasm/` crate (the iroh browser client, a thin
+    `IrohSocket { connect(ticket, alpn), send, recv, close }` over wasm-bindgen), built
+    reproducibly like notes-wasm (`scripts/build-guest-wasm.sh`, pinned rustc, wasm-bindgen and clang:
+    ring compiles C for wasm32) and committed beside the guest page; loaded by dynamic import only on
+    the guest page, so the app does not grow. Size: about 1 MB gzip (n0's example is 2.6 MB raw,
+    1.1 MB gzip), on top of the notes wasm's 0.2 MB.
+  * **The link** carries everything in the fragment, so any static origin can serve the page:
+    `https://<page origin>/n/#2.<room>.<key>.<endpoint id>.<relay host>` (format 2; format 1 links
+    from 0.24.0 keep working). The guest endpoint is pinned to that one relay (the owner's home relay
+    for that room's endpoint), with no address lookup (`presets::Minimal`, never n0's DNS).
+  * **Relay:** ours by default once it runs (deploy/relay/, `remote_relays`), as the remote-access
+    rule already says ("ours by default once they exist"). Until then n0's public relays (Corey):
+    they accept browsers but are documented as for development and testing, rate-limited, without
+    guarantees, so the Invite guests menu says "through a free testing relay" while they are in use.
+  * **Page origin:** the guest page needs an HTTPS origin, which the owner's computer cannot provide
+    to the internet. It is published as a static site (Corey: GitHub Pages now): from this repo by
+    the `pages` workflow, which already deploys `site/`, at a stable path, CSP by meta tag (`connect-src 'self'
+    https://<relay> wss://<relay>`, plus `'wasm-unsafe-eval'`); our own domain later. The page holds
+    no data: everything arrives sealed over the relay.
+  * **Limits:** guests work only while the owner's computer is online and awake (the sleep
+    inhibitor holds while a room is live, as while recording); every guest's traffic goes through
+    the owner's one relay connection (our relay allows 1 MB/s per client: ten guests loading a 1 MB
+    snapshot take about ten seconds); nothing reaches guests while the owner is offline.
+- **2. A tunnel to this computer** (when the owner wants plain HTTPS links or iroh is blocked): the
+  app runs the publish host as a sidecar on a loopback port, serving only `/n/`, `/live/`, `/p/` and
+  `/pub/`, never the backend's `/api/` or `/ws`, and opens a tunnel to that port: **Tailscale Funnel**
+  when Tailscale is logged in (`https://<machine>.<tailnet>.ts.net`), else a **Cloudflare quick tunnel**
+  (`*.trycloudflare.com`, no account; `cloudflared` downloaded on first use with a pinned SHA-256 by
+  services/downloads.py). The tunnel opens when a room starts and closes when it is stopped or
+  expires. Cloudflare terminates TLS but only sees our ciphertext. Same awake rule as iroh.
+- **3. A publish host** (0.24.0's path; ours once it runs, or one the owner runs): the only one that
+  keeps working after the owner's computer sleeps, so it is the choice for links that should outlast
+  the meeting.
+
+- **Choosing a transport.** A new setting `guest_transport`: `auto` (default), `iroh`, `tunnel`,
+  `host`. `auto` = iroh, plus the host mirror when a publish host is configured (below). The Invite
+  guests menu says which one is in use and what follows from it ("Works while this computer is on").
+- **Mirror to a host when one exists.** With `guest_host`/`publish_host` set, the bridge runs the
+  iroh room and the host room side by side (it already seals once and sends to a room; it would send
+  to two) and the link carries both: `https://<host>/n/<room>#2.<room>.<key>.<endpoint>.<relay>`. The
+  page tries iroh first (about 8 seconds), then the host's `wss://…/live/<room>`, keeping a `since`
+  per transport; after the meeting, the host keeps the read-only copy available when the owner's
+  computer is off.
+- **After the meeting without a host:** read-only works while the owner's computer is on, and
+  (Corey: yes) the guest page keeps the last copy in the browser until the link expires, so a guest
+  who already opened it can reread it when the owner's computer is off. Kept sealed, not decrypted:
+  the last snapshot envelope in IndexedDB under the room id, opened with the key from the link each
+  time; deleted at expiry (the `expires` from welcome/ended) or when the page learns the room is gone
+  (4410). The name card's consent line and docs/guest-notes.md say a copy stays in the browser.
+- **Security.** Unchanged from phase 9: the key never leaves the fragment, the relay and the tunnel
+  see only ciphertext, the room token gates joining, caps per room. New: a guest endpoint per room
+  (revoked by dropping it), the tunnel exposes only the publish host's routes, never the backend.
+  The relay sees endpoint ids, timing and sizes, as for remote access.
+- **Tests.** Rust: the guest endpoint in link/ (`cargo test`) with an in-process relay
+  (`iroh-relay` test-utils), a native client speaking the wire, and rooms.rs reused; the bridge
+  against the sidecar's loopback ws (Python, a fake sidecar as today). Browser: wasm-bindgen tests
+  for `IrohSocket` where practical; a Playwright spec with a local iroh relay behind a CA the test
+  browser trusts (Chromium `--ignore-certificate-errors` against a self-signed relay; WebKit is the
+  open risk). Tunnels: unit-tested command lines and parsing only (no network in tests).
+- **Not in v1:** a mailbox while the owner is offline (only the host path); guests' browsers
+  talking to each other directly; Logos Delivery (the trial first).
+
+- **Before it ships:** a Playwright run of the iroh path in WebKit (the open browser risk), the
+  guest page live on GitHub Pages, and the menu's wording for each transport ("works while this
+  computer is on", "through a free testing relay", "through a temporary Cloudflare address").
+
+## Phase 11: the notes editor, live
+
+### Phase 11 design (drafted 2026-10-25, for review)
+
+Status: built 2026-10-25, unreleased, with the corrections in docs/plans/2026-10-25-phase-11-tasks.md.
+Asked for by Corey (2026-10-25) after comparing our editor with David's kb (hashseq web/kb.js at
+94f5e3c, APP_NOTES 22 "the chrome was in the way"): tools where the work is, live carets and
+selections (also across iroh and the host mirror), and inserts that know the meeting. Decided by
+Corey (2026-10-25): a slim fixed toolbar stays beside the new tools; only task lines with a person
+become action items; guests' ones count, named as theirs; guests may insert time chips.
+
+Why: the notes are now edited live by the owner, the team and guests, but they show only "Ina is
+typing", formatting means a trip to a fixed bar, and nothing in the notes knows it belongs to a
+meeting: a moment, a person or an earlier meeting is plain text, and a to-do typed during the
+meeting reaches Tasks only if the summary happens to pick it up.
+
+No change to the document model. Everything stays phase 6's flat seq (line kinds as closed `block`
+marks, inline marks); the inserts are `link` marks with `mnemosyne:` URLs. The wire changes only in
+presence, with optional fields, so pages and apps from 0.24 and later keep working together.
+
+**1. Tools where the work is** (one implementation in src/lib/notes/ui/, used by SharedNotes on the
+desktop and the team web app, and by the guest page)
+
+- **Selection toolbar.** A selection that is not collapsed opens a small toolbar above it (below
+  when there is no room), following scroll; it hides on collapse, Escape and typing. Buttons:
+  Bold, Italic, Strike, Code, Link, Comment, and "Turn into" (Text, Heading 1-3, Bulleted,
+  Numbered, Task, Quote, Code block) for the selected lines. Read-only readers get Comment only, as
+  today. It sits outside the contenteditable (text extraction never sees it), is placed from the
+  range's client rects, is a `role="toolbar"`, and Alt+F10 focuses it (Escape gives the editor its
+  focus and selection back). Its buttons call the existing `EditorInput` (`toggleInline`,
+  `setLineKind`, the link request, the comment flow): no new commands.
+- **`/` menu.** Typing `/` at a line start or after a space (not inside code, inline code or a
+  link) opens a menu at the caret; what follows filters it (names and aliases); ↑/↓, Enter or Tab
+  picks; Escape, or a space when nothing matches, closes it and leaves the text. Picking removes the
+  `/query` and applies, as one undo entry. Ctrl+/ opens it anywhere. Groups: "This meeting" (Time
+  now, Action item, Person, Earlier meeting, each only where it can work) first, then "Blocks"
+  (Text, Heading 1-3, Bulleted, Numbered, Task, Quote, Code block, Table). The editor keeps focus
+  (a listbox through `aria-activedescendant`). `@` opens the person picker and `[[` the meeting
+  picker directly, under the same rules.
+- **A slim fixed toolbar stays** (Corey): one row instead of today's four groups: "Turn into" (the
+  line kinds), Bold, Italic, Task, Insert (opens the `/` menu at the caret, for those who never type
+  `/`) and Comment; the rest lives in the selection toolbar and the `/` menu. A quiet hint under the
+  editor ("Type / for blocks and inserts, @ for a person, [[ for a meeting"); the status line
+  stays; every shortcut stays.
+- **Touch** (`pointer: coarse`, mostly guests on phones): the native selection menu is left alone; a
+  compact bar sits above the on-screen keyboard (`visualViewport`) with Bold, Italic, list, task, `/`
+  and Comment.
+
+**2. Live carets and selections**
+
+- **What travels:** your selection as two anchors, each the element id of the character before the
+  position (null = the start), the anchoring the editor already uses to keep its own caret through
+  remote edits (`seqIdAt`/`seqPositionOf`, APP_NOTES 20). Only while the editor has focus; blur
+  sends none. An id not known yet (its frame still on the way) hides that caret until it arrives.
+- **Desktop and team web app:** the notes WebSocket's presence JSON gains `sel`
+  (`{"type":"presence","typing":b,"sel":{"a":id|null,"f":id|null}|null}`). Clients send it at most
+  every 100 ms; the hub drops faster ones, relays it with a stable member key, and never stores or
+  logs it. Readers send it too (they select to comment).
+- **Guests:** the PRESENCE envelope gains an optional `sel` (older pages ignore it), sent on change
+  at most every 150 ms plus the existing heartbeat. Hosts relay it as they relay presence today,
+  never logged.
+- **The bridge** turns guests' presence into the desktop's `guests` JSON with carets, and the
+  owner-side members' presence into sealed PRESENCE envelopes for the room (gid `o:<member key>`),
+  one per visible member instead of today's single owner heartbeat.
+- **Across the mirror:** the bridge forwards each guest PRESENCE envelope it hears in one of the
+  meeting's rooms, byte for byte, into the others (the iroh room and the host mirror). Guests on
+  iroh and guests on the host see each other, typing included, which closes phase 10's open limit.
+  No loop: a room never echoes to its sender, and the bridge forwards only what it did not send.
+- **Rendering:** an overlay beside the editor root (`pointer-events: none`, `aria-hidden`): a 2 px
+  caret in the person's colour with a name flag (shown when it moves, fading to the bar after 3 s),
+  selections as translucent rects; recomputed in one animation frame after a remote frame, a local
+  render, scroll or resize. Colours: 8, index = a hash of the member key; the present list shows
+  each person's dot, yours included.
+- **Cost:** a presence update is about 200 bytes sealed; ten people moving their carets at the
+  limit is about 13 KB/s, within n0's relays and ours.
+
+**3. Inserts that know the meeting** (chips)
+
+- All three are `link` marks with a `mnemosyne:` URL over ordinary text, so notes-core, markdown
+  render and parse, sync, the fold and comments need no change. A link whose URL starts with
+  `mnemosyne:` renders as a chip: the link prompt does not open on it, Backspace at its end removes
+  it whole, and concurrent different URLs fall back to plain text as links already do.
+  * **Time:** text `12:34` (the joined timeline when inserted), URL `mnemosyne:t/<part>/<seconds>`
+    (part + seconds, like bookmarks and comment anchors). The value is the live clock while
+    recording, else the player's position, else Time is not offered. A click seeks the player
+    (desktop, team web app). Guests can insert it when META carries `clock: {part, started_at}`
+    (new, sent while recording; the page counts from when it received it); on the guest page chips
+    are plain text, as guests have no audio. Combine (services/combine.py) rewrites the other
+    meeting's part numbers in these URLs, as it renumbers its parts.
+  * **Person:** text `@Ada Lovelace`, URL `mnemosyne:person/<name>` (people are by name,
+    services/people.py). Picker: this meeting's speakers and attendees first, then People (on a
+    team server only people from meetings the caller can see); on the guest page only the names
+    present in the room, else free text: the guest page never receives People. A click opens the
+    person.
+  * **Earlier meeting:** text = its title and date, URL `mnemosyne:meeting/<id>`. Picker: the
+    meeting search the caller can already run, never on the guest page. A click opens it when
+    visible, else says it is not shared with you; guests see the text only.
+- **Elsewhere:** `Session.notes` keeps the markdown links. Obsidian export renders time chips as
+  `12:34`, person chips as `[[Ada Lovelace]]` when people links are on (else the name), meeting chips
+  as a link to that meeting's note when it is exported (export/links.py), else the title. The
+  summary, search, Ask and MCP see plain text (`@Ada Lovelace`, `12:34`, the title), never
+  `mnemosyne:` URLs (one `plain_notes` helper). Publishing never includes notes (unchanged).
+
+**Action items from the notes**
+
+- A task line with a person chip is an action item of the meeting (Corey); a task line without one
+  stays a checklist in the notes.
+  Owner = the line's first person chip, text = the line without chips, `at` = its first time chip,
+  done = `task_done`. "/Action item" makes the line a task and opens the person picker.
+- They are derived at each fold (the sidecar's fold reply lists task lines with their line ids, as
+  it lists comment ranges) into `sessions.notes_items`, keyed by the line's terminator id, so they
+  need no summary: Tasks, the brief, the digest and Obsidian list them within seconds of typing
+  (`TaskItem.source = "notes"`). Phase 4 linking treats them as mentions (key
+  `<session>:n:<line id>`). Done goes both ways: ticking in Tasks writes `task_done` into the doc
+  through a new sidecar op `set_kind` (broadcast like `mark_comment`); ticking in the notes reaches
+  the task object at the next fold.
+- The summary is told they are already action items, and `same_item` drops LLM items that repeat
+  them. Their text and owner change in the notes only; done, follow, due and the issue link
+  anywhere.
+- Guests' task lines count too (Corey), as ordinary items; the history line names the guest. Library sync carries
+  the doc and each machine derives the items; phase 8 recipients see them read-only.
+
+**Tests.** Vitest: toolbar placement, `/` triggers and filtering, caret anchors through remote
+edits, chips and their plain text, throttles. cargo test: notes-core's `set_kind` and the fold's
+task list. pytest: the hub's `sel` relay and rate limit, the bridge's presence conversion and
+mirror forwarding, `notes_items`, fan-out into the doc, combine's rewrite, export. Playwright
+(Chromium and WebKit): two desktop pages see each other's caret; an iroh guest and a mirror guest
+see each other's caret and typing; the `/` menu and the toolbar; a time chip seeks; an action item
+typed in the notes shows in Tasks, and ticking it there ticks the line.
+
+**Order:** part 1 first (2 and 3 render inside it); then 2 and 3, which are independent.
+
+**Not in v1:** images in notes; dragging lines (our flat seq makes a move a delete plus an insert,
+so typing inside a moved line would stay behind: needs a look at hashseq's Move first); per-author
+colours on text; `mnemosyne:` links opened from Obsidian or a browser (a URL scheme handler); math.
+
 ## Later, each behind the prerequisites below
 
 - **Live shared notes** during a meeting: a scratchpad attendees type into (desktop, or the team
@@ -501,11 +1032,12 @@ Drafted against the code at 273eaf3 (hashseq 94f5e3c), reviewed and accepted.
 - **Tasks, people and decisions as objects** that meetings link to: an action item keeps one
   identity across meetings instead of `same_item` text matching; Tasks, topic notes and the
   decisions log read those objects.
-- **Team sharing without a central copy**: each member's machine holds the meetings shared with
-  it.
-- **Publishing**: a curated meeting (summary, decisions, clips) as a space, through David's
-  Basecamp module over Logos Delivery or a relay, with a static wasm viewer. Fits "Logos
-  Messaging is later".
+- **Team sharing without a central copy**: drafted as phase 8 (owner as hub). Later: a mesh, so
+  recipients sync with each other while the owner is offline (per-op signatures, unsigned ops
+  dropped when rendering).
+- **Publishing**: designed as phase 7 (encrypted snapshots, not a space). Later: readers
+  following live edits or commenting (a hashseq space), publishing over Logos Delivery or
+  Storage once a supported module and a web reader exist.
 - **Records**: a meeting's frontier is a hash of its exact state, a candidate for sealing record
   versions (services/records.py); clips as artifacts can be erased for retention while the rest
   still verifies.

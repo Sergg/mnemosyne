@@ -40,13 +40,13 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from ..models.sync_session import SyncSession, SyncTombstone
-from .sync_peers import SyncPeer, ensure_dialed, now_iso
+from .sync_peers import SyncPairingError, SyncPeer, ensure_dialed, now_iso
 
 if TYPE_CHECKING:
     import httpx
 
     from ..api.context import AppContext
-    from ..models.sync import SyncChanges
+    from ..models.sync import SyncChanges, SyncContacts
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,10 @@ REQUEST_TIMEOUT = 60.0
 
 class SyncSkew(Exception):
     """The peer speaks another sync protocol."""
+
+
+class PeerMismatch(Exception):
+    """The computer behind the peer's endpoint states another sync id than the one paired."""
 
 
 class PeerLocked(Exception):
@@ -86,6 +90,7 @@ class PeerState:
     waiting: int = 0  # meetings left for the next round (their notes merge failed)
     clashes: dict[str, str] = field(default_factory=dict)  # meeting id -> name
     app_version: str | None = None
+    warning: str | None = None  # sticky: set and cleared by the round that finds it (contacts)
     backoff: float = 0.0  # seconds; 0 when the peer answered last time
     retry_at: float = 0.0  # time.monotonic() before which the scheduler leaves it alone
 
@@ -116,6 +121,9 @@ class SyncService:
         self._loop_task: asyncio.Task | None = None
         self._wake: asyncio.Event | None = None  # made in start(): bound to the running loop
         self._announced = 0  # the change counter last told to the peers
+        # Hosted copies of publications that lost a merge (two machines published the same
+        # meeting): deleted from the publish host once back on the event loop (flush_host_deletes).
+        self.host_deletes: list[dict] = []
         ctx.repo.device_id = self.me
 
     # ---- identity, claiming -----------------------------------------------------------------
@@ -310,10 +318,14 @@ class SyncService:
                 raise LinkError("Remote access is not running")
             async with self.client_for(peer) as client:
                 await self._hello(client, peer, st)
+                await self._contacts(client, peer, st)
                 await self._pull(client, peer, st)
             await self._reconcile_tasks(st)
         except SyncSkew as e:
             st.state, st.error = "skew", str(e)
+        except PeerMismatch as e:
+            st.state, st.error = "error", f"{peer.name} is another computer now: pair again"
+            logger.warning("Sync with %s skipped: %s", peer.name, e)
         except PeerLocked:
             st.state, st.error = "locked", f"{peer.name} is locked: enter its recovery code there"
         except (httpx.TransportError, LinkError) as e:
@@ -375,7 +387,18 @@ class SyncService:
         if hello.protocol < PROTOCOL:
             raise SyncSkew(f"Update Mnemosyne on {peer.name} (it runs {hello.app_version})")
         if hello.id and hello.id != peer.id:
-            logger.warning("Sync peer %s calls itself %s now", peer.id, hello.id)
+            if not peer.provisional:
+                raise PeerMismatch(f"Sync peer {peer.id} calls itself {hello.id} now")
+            old = peer.id
+            try:
+                self.ctx.sync_peers.adopt_id(old, hello.id)
+            except SyncPairingError as e:
+                raise PeerMismatch(f"Sync peer {old} calls itself {hello.id} now: {e}") from e
+            self.ctx.repo.rename_sync_peer(old, hello.id, TOMBSTONE_CURSOR)
+            if old in self.states:
+                self.states[hello.id] = self.states.pop(old)
+            self._locks.pop(old, None)
+            logger.info("Sync peer %s is %s", old, hello.id)
         if peer.since > hello.seq:
             # Its change log is younger than our cursor (restored from a backup): start over.
             # Whatever we have already is ignored or merged as usual.
@@ -383,6 +406,82 @@ class SyncService:
                 "Sync with %s: its change log restarted; reading it from the start", peer.name
             )
             self.ctx.sync_peers.update(peer.id, since=0)
+
+    async def _contacts(self, client: httpx.AsyncClient, peer: SyncPeer, st: PeerState) -> None:
+        """Take in the peer's contacts (global to the library, not part of any meeting: they
+        never ride in a SyncSession). Merged row by row (`contacts.merge_rows`); the live ones
+        that changed get their CONTACT devices and are dialed in the background. An older peer
+        answers 404 and a team server 409: nothing to do. A peer under another person key (paired
+        before the key was shared) is brought to one key first (`_converge_key`). Only a locked
+        or unreachable peer stops the round; any other trouble here is logged and the meetings
+        still sync."""
+        from ..models.sync import SyncContacts
+        from . import contacts
+
+        if self.ctx.settings.team_mode:
+            return
+        r = await client.get("/api/sync/contacts")
+        if r.status_code in (404, 409):
+            return
+        if r.status_code == 423:
+            raise PeerLocked()
+        if r.status_code >= 400:
+            logger.warning("Sync with %s: its contacts answered %d", peer.name, r.status_code)
+            return
+        try:
+            got = SyncContacts.model_validate(r.json())
+        except ValueError:
+            logger.warning("Sync with %s: its contacts were not understood", peer.name)
+            return
+        if got.person != self.ctx.person.public_hex:
+            if not await self._converge_key(client, peer, st, got):
+                return
+        else:
+            st.warning = None
+        changed = await contacts.apply_peer_rows(self.ctx, [c.model_dump() for c in got.contacts])
+        if changed:
+            self._spawn(contacts.dial_in_background(self.ctx, changed))
+
+    async def _converge_key(
+        self, client: httpx.AsyncClient, peer: SyncPeer, st: PeerState, got: SyncContacts
+    ) -> bool:
+        """The peer signs with another person key (the two computers were paired before the key
+        was shared, so each made its own). Same rule as pairing (`contacts.adoption`), computed on
+        both sides from what both know, so they agree without talking: both have people data:
+        different people, warn and share no contacts; exactly one has: the other adopts; neither:
+        the higher key adopts the lower. Only the adopting side acts (it reads the peer's key and
+        takes it); the other changes nothing and finds equal keys next round. True when the keys
+        are now equal and the merge can go on."""
+        from . import contacts
+        from .person import PersonKeys
+
+        mine, theirs = self.ctx.person.public_hex, got.person
+        mine_has = contacts.has_people_data(self.ctx)
+        if mine_has and got.has_people_data:
+            st.warning = f"{peer.name} belongs to another person: contacts are not shared"
+            logger.warning("Sync with %s: %s", peer.name, st.warning)
+            return False
+        if mine_has != got.has_people_data:
+            adopt = not mine_has
+        else:
+            adopt = mine > theirs
+        if not adopt:
+            return False
+        try:
+            r = await client.get("/api/sync/person-key")
+            r.raise_for_status()
+            private = str(r.json()["private"])
+            if PersonKeys.public_of(private) != theirs:
+                raise ValueError("the key sent is not the one it announced")
+            if contacts.has_people_data(self.ctx):  # got contacts since the look above
+                raise ValueError("this computer has contacts under its own key")
+            self.ctx.person.replace(private)
+            contacts.on_key_changed(self.ctx)
+        except Exception as e:  # noqa: BLE001 - meetings still sync; the next round tries again
+            logger.warning("Sync with %s: could not take its person key: %s", peer.name, e)
+            return False
+        st.warning = None
+        return True
 
     async def _pull(self, client: httpx.AsyncClient, peer: SyncPeer, st: PeerState) -> None:
         from ..models.sync import SyncChanges
@@ -411,6 +510,7 @@ class SyncService:
             outcomes, new_cursor, stuck = await asyncio.to_thread(
                 self._take_page, peer, page, cursor
             )
+            await self.flush_host_deletes()
             for o in outcomes:
                 self._count(st, o)
                 if o.kind in ("new", "updated", "merged"):
@@ -436,6 +536,14 @@ class SyncService:
             self._publish(peer, st)
             if not page.more or pos <= since:
                 return
+
+    async def flush_host_deletes(self) -> None:
+        """Delete the hosted copies queued by `take` (best effort, logged when it fails)."""
+        from . import sync_publications
+
+        rows, self.host_deletes = self.host_deletes, []
+        for row in rows:
+            await sync_publications.delete_hosted(self.ctx, row)
 
     def _count(self, st: PeerState, o: _Outcome) -> None:
         if o.kind == "clash":
@@ -488,7 +596,7 @@ class SyncService:
     def take(self, peer: SyncPeer, theirs: SyncSession) -> _Outcome:
         """One meeting from `peer` into the library. The meeting's notes lock (the one folds and
         catch-ups take) is held throughout: nothing folds the notes document while it is merged."""
-        from . import shared_notes
+        from . import shared_notes, sync_publications
 
         sid = theirs.id
         if self.ctx.repo.has_tombstone(sid):
@@ -496,9 +604,18 @@ class SyncService:
         with shared_notes.hub(self.ctx).lock(sid):
             # What was typed here is folded in first, so our version is current.
             shared_notes.fold_blocking(self.ctx, sid)
-            return self._take_locked(peer, theirs)
+            before = self.ctx.repo.session_publications(sid)
+            outcome = self._take_locked(peer, theirs)
+            if outcome.kind in ("new", "updated", "merged"):
+                # Publications that arrived changed: files here that no longer match go.
+                try:
+                    self.host_deletes += sync_publications.settle(self.ctx, sid, before)
+                except Exception:
+                    logger.warning("Sync: publication files of %s not settled", sid, exc_info=True)
+            return outcome
 
     def _take_locked(self, peer: SyncPeer, theirs: SyncSession) -> _Outcome:
+        from ..models.sync_session import merge_publications
         from . import sync_notes
         from .link import find_binary
         from .shared_notes import NotesDocError
@@ -544,6 +661,9 @@ class SyncService:
             if united is not None:
                 sync_notes.store_union(self.ctx, sid, united, peer.name)
                 theirs = theirs.model_copy(update={"notes": united.markdown})
+            theirs = theirs.model_copy(
+                update={"publications": merge_publications(ours.publications, theirs.publications)}
+            )
             write_session(repo, theirs, local_device_id=me, vv=theirs.vv, bump=False)
             if adopt_doc:
                 sync_notes.adopt(self.ctx, sid, theirs.notes_doc, peer.name)

@@ -130,6 +130,17 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
 - The Release workflow runs the AppImage smoke test (reusable `smoke.yml`) before publishing. To
   re-test an existing build without rebuilding: `gh workflow run "Smoke test" -f run_id=<Release
   run id>`. The script refuses to run outside CI (it starts PulseAudio with a null sink).
+- Publishing: after changing `viewer/` or `publication_format.py`, run `pnpm build:viewer` and commit
+  backend/mnemosyne/api/static/viewer/ (the `viewer` CI job fails on a stale build). The Python and TS formats must
+  agree: backend/tests/vectors/publication_v1.json is checked by both; regenerate it with
+  backend/scripts/make_publication_vectors.py only on purpose (a format change breaks old links: bump `FORMAT`).
+- Guest notes: after changing `guest/` or `guest_format.py`, run `pnpm build:guest` and commit
+  backend/mnemosyne/api/static/guest/ (the `viewer` CI job fails on a stale build). The Python and TS formats must
+  agree via backend/tests/vectors/guest_v1.json; regenerate it with backend/scripts/make_guest_vectors.py only on purpose.
+- Publish host "version already exists" (409 with `current` = ours) counts as success only when `GET /pub/<id>`
+  returns an ETag equal to the SHA-256 of our manifest; else another computer published that version (`_host_upload`).
+- A "this computer" publication link only reaches others through the team listener (or `phone_url`): `local_reach`.
+  With neither, the dialog says so. `add_seal` used to dedup publish events away; `EVENT_SEALS` forces them.
 - Meetings can have several parts (services/parts.py): `Recording.part`/`offset`, the session's
   `audio_file` is all parts joined, transcript times are on that joined timeline. Never replace a
   session's audio or transcript wholesale when recording into it again; go through `add_part()`.
@@ -174,6 +185,10 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
   pytest suite OOM-killed the desktop app (2026-10-05), and CPU-heavy runs have frozen it. Locally
   run single test files, `pnpm check`, `cargo check`, ruff; leave the full suite, full e2e and
   builds to CI (push and watch the run, or a Release workflow_dispatch), or ask Corey first.
+- Tests never open a public tunnel: conftest's `no_tunnel` stubs services/tunnel.py (a test once opened a real
+  Cloudflare quick tunnel). Keep it that way.
+- Guest frames carry a full snapshot: 8 MiB + 64 KiB, in BOTH frame.rs copies (link/src/guest/frame.rs and
+  guest-wasm/src/frame.rs). They must match.
 - Never `pgrep`/`pkill` with a pattern that appears in your own command line; use the
   `pgre[p]` bracket trick or `fuser -k <port>/tcp`. A `uv run uvicorn` child survives
   killing the `uv` wrapper; kill by port.
@@ -189,6 +204,15 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
   (URLs, `comment:<id>`) travel as 0xAF artifact frames beside the 0xDE delta, never inside it.
 - Indexes in the notes model and the sidecar are code points, not UTF-16 (src/lib/notes/model.ts
   `cpLen`/`cpIndex`/`utf16Index`); an astral character is 1 there and 2 in a JS string.
+- Notes chips are `link` marks with `mnemosyne:` URLs; dom.ts gives an `href` only to http(s) and mailto, so a chip
+  (or a peer's `javascript:` link) never navigates. Anything that is not the editor must read `plain_notes` /
+  `obsidian_notes`, never the raw markdown.
+- A notes item's state (done, follow, due, issue_url, task_id) is written only through `notes_items.write_fields`: it
+  `_touch`es the meeting for library sync and appends the `set_kind` frame for done. The derivation at a fold
+  (`notes_items.apply`, `set_notes_items`) never `_touch`es: each machine derives its own. `set_text` may give a line
+  a new id, so a vanished line's state moves to the line with the same text and owner.
+- `src/lib/notes/ui/` imports only from `src/lib/notes/` (never `$lib/stores`, `$lib/api`, toasts): the guest Vite
+  entry bundles it. App-only behaviour comes in through the host and provider objects.
 
 ## Roadmap (agreed 2026-09-22)
 
@@ -453,6 +477,89 @@ id-anchored; harness at /dev/notes-editor). Library sync merges two documents by
 (services/sync_notes.py), no base. Comments on notes are marked by the SERVER (`notes_ids` ->
 `mark_comment`), so a read-only reader can comment. Edit rule: owner, admin, shared-with; other
 readers read. No sidecar: hello says `unavailable` and LegacyNotesEditor (the textarea) is used.
+Publishing (unreleased, phase 7; design in the hashseq plan, use in docs/publishing.md): a curated, encrypted
+copy of a meeting behind a link `https://<host>/p/<id>#<key>`, never the record. One encrypted snapshot per version
+(services/publication_format.py: padded JSON manifest + Ogg Opus clip blobs, AES-256-GCM, AAD
+`mnemosyne/pub/1|id|kind|version`, one random key per publication that only the fragment carries), built by the
+`publish` job (services/publishing.py: selection, names, `redact_identifiers` + `redact_contacts`, quotes with
+optional clips). The manifest has no transcript field, only chosen quotes; a test asserts it. The viewer is a
+separate Vite entry (`viewer/`, Svelte 5, WebCrypto, no wasm), committed as backend/mnemosyne/api/static/viewer/
+and rebuilt reproducibly with `pnpm build:viewer`; CI (`viewer` job) diffs it. The backend serves it and the sealed
+files on open routes `/p/` and `/pub/` (api/routes/publishing.py), also on the team listener; `publish-host/` (axum
+crate, `cargo test` in CI) + deploy/publish/ is the same read side with authenticated writes, caps and mandatory
+expiry. Also: a one-file export (services/publication_file.py, `single.html`, optional PBKDF2 password), the
+`publications` table travelling in `SyncSession.publications` (services/sync_publications.py; hosted ones editable
+from either computer, "this computer" ones only from the one serving them), and records (publish, update, unpublish
+seal a version; `publications.json` in the export, never the key). Team servers: `allow_publishing`, owner or admin.
+Logos storage/delivery is only a written trial (docs/plans/2026-10-23-logos-publishing-trial.md).
+Sharing with people (released as 0.23.0, phase 8; design in the hashseq plan, build order and corrections in
+docs/plans/2026-10-23-phase-8-tasks.md): meetings shared between different people's desktops with
+the owner's machines as the hub. A person key (services/person.py, Ed25519, sealed with encryption
+at rest, shared by one person's machines through library-sync pairing). Contacts
+(services/contacts.py): signed cards listing a person's machines, a `contact` invite, CONTACT devices
+whose token is derived from a per-pair secret and opens only `/api/share/*` as that contact's
+Principal. Tunnelled TCP reaches the backend from 127.0.0.2 (link sidecar), so it always needs a
+token and never counts as this machine. Owner: `peer_shares`, a signed `SharedMeeting` per share
+with only the chosen parts (services/shares.py), `/api/share/changes` and signed contributions
+(comments, done/follow, notes frames) checked before the normal write paths. Recipient:
+`sessions.shared_from`, SharePuller (pull + verify + `apply_shared`), the outbox
+(services/share_push.py), local rules in services/shared_with_me.py; such meetings never enter
+library sync, task links, Ask, semantic search, the digest or Obsidian (`shared_in_*`). Demo mode
+seeds Ada Lovelace's shared meeting only through `POST /api/demo/share` (the e2e spec calls it).
+
+
+Guest notes (released as 0.24.0, phase 9; design in the hashseq plan, build order and corrections in
+docs/plans/2026-10-24-phase-9-tasks.md, use in docs/guest-notes.md): a link `https://<host>/n/<room>#<key>` for the
+people in a meeting to type into the live notes, comment on them and see the agenda; nothing else goes out. Sealed
+frames (services/guest_format.py, AES-GCM under HKDF keys from the fragment key, AAD `mnemosyne/guest/1|room|kind`)
+relayed by a room on a publish host (publish-host/src/rooms.rs + live.rs: WebSocket relay, log, snapshot, caps).
+services/guest_notes.py is the bridge (hidden `shared_notes` member seals local frames out; guests come in through
+`accept_frames` as `guest:<gid>`; comments via `comments.create` with an explicit actor, marked by the owner's server;
+sealed snapshots and META with the agenda); api/routes/guest_notes.py is start/end/new link/stop. The page is `guest/`
+(Vite entry reusing src/lib/notes and the wasm), built with `pnpm build:guest` into backend/mnemosyne/api/static/guest
+and diffed by the CI viewer job; vectors backend/tests/vectors/guest_v1.json are shared by Python and TS; the e2e job
+runs a local publish host on 8028 (tests-e2e/start-publish-host.sh). Settings: `guest_host` (else `publish_host`, else
+ours, which does not run yet: 409 "No host for guest notes"), `guest_notes_end_hours` (12 after the recording stops),
+`allow_guest_notes` (team servers, owner or admin). Rules: the host never sees the key; owner-side frames (typing,
+copilot, phase 8) reach guests as the owner's; guest comments are ordinary comments (searchable, synced, in records);
+one room per meeting; a deleted meeting's room is deleted; refused for shared_from meetings and without the sidecar.
+
+Guest notes without a host (released as 0.25.0, phase 10; design in the hashseq plan, build order and corrections in
+docs/plans/2026-10-25-phase-10-tasks.md, use in docs/guest-notes.md): guest notes need no publish host. The rooms
+sidecar `mnemosyne-link rooms` (link/src/guest.rs; services/link.py `RoomsLink`, started on demand, NOT tied to remote
+access) embeds the publish host on a loopback port and gives each room its own guest iroh endpoint (ALPN
+`mnemosyne/guest/1`, one bi stream per guest, framed, proxied to the loopback WebSocket); room keys live in
+`<data_dir>/guest_rooms/keys` so a link survives restarts. services/guest_notes.py `plan` (setting `guest_transport`):
+auto = iroh, else tunnel (services/tunnel.py: Tailscale Funnel, else a Cloudflare quick tunnel, cloudflared fetched by
+services/downloads.py), else host; a configured publish host is also a MIRROR (a second Bridge, same room id and key).
+Link format 2: `https://<origin>/n/#2.<room>.<key>.<endpoint>.<relay host>`; the page tries iroh first, then the host's
+wss, with a `since` per transport. The page is served from GitHub Pages (`guest_page_url`; pages.yml adds the meta CSP
+to that copy only) and keeps a sealed copy in IndexedDB. guest-wasm/ (iroh in the browser, relay-only) is built ONLY by
+CI (no clang locally): after changing it, push, take the `guest-wasm-pkg` artifact of the guest-wasm job (`gh run
+download <run> -n guest-wasm-pkg -D guest/pkg`), commit guest/pkg, then `pnpm build:guest` and commit
+backend/mnemosyne/api/static/guest. The guest e2e uses `mnemosyne-link dev-relay` on 8038 (feature `dev-relay`, never
+in releases). The room stays up only while this computer is on (sleep inhibitor held while a room is live).
+
+The notes editor, live (released as 0.25.0, phase 11; design in the hashseq plan, build order and corrections in
+docs/plans/2026-10-25-phase-11-tasks.md): one editor for the desktop and the guest page, tools where the work is, live
+carets, chips, and action items typed in the notes. `src/lib/notes/ui/` (`NotesEditor.svelte`, slim, selection and
+touch toolbars, `/` `@` `[[` menu in slash.ts, `CaretOverlay.svelte`) is mounted by components/SharedNotes.svelte and
+guest/src/Notes.svelte through a `NotesHost` plus `presence` / `inserts` providers (src/lib/app/notesPresence.ts,
+notesInserts.ts, guest/src/presence.ts, inserts.ts); input.ts gained `command`, `setLineKind(kind, {toggle:false})`,
+`onTyped` and `interceptKey`. Presence: `Member.key` (`m<8 hex>`), `sel` ({a, f} element ids) and `typing` in memory in
+services/shared_notes.py, `presence.members` plus coalesced `caret` (100 ms) to the editors; the guest bridge is a
+`presence_tap` member that seals owner-side carets to the room as PRESENCE `o:<key>` (guest_notes.py), hears guests'
+PRESENCE `sel` / `gone` back as `guests` + `guest_caret`, and forwards a guest's envelope into the other rooms
+(publish-host rooms.rs has a separate presence channel, 10/s). Chips are `link` marks with `mnemosyne:t/<part>/<s>`,
+`person/<name>`, `meeting/<id>` URLs (src/lib/notes/chips.ts; services/notes_chips.py `plain_notes`, `obsidian_notes`,
+`retarget_chips`, `task_line_parts`); time chips count from `clock` {part, offset, started_at} (services/parts.py
+`recording_clock`, on start/active recording and the guests' META). Notes items (services/notes_items.py): a task line
+with a person chip is an action item, `Session.notes_items` (`sessions.notes_items`, ids 16 hex from the line id)
+derived at every fold-result site from the sidecar's new `tasks` list; they are task objects (`TaskItem.item_id`,
+`source`, `idx` < 0; task_links, item_flags, Obsidian, sync's `SyncSession.notes_items`), changed through
+`PATCH /api/sessions/{id}/notes-items/{item_id}`, and a tick goes into the document with the sidecar's `set_kind`
+(notes-core/src/api.rs). Tests: backend test_notes_items / test_notes_chips, Vitest chips/slash/carets/placement,
+tests-e2e/notes-items.spec.ts; harness at /dev/notes-editor.
 
 Candidates next: offline installer (pre-seeded uv cache). Flathub is on hold (Corey, 2026-09-29).
 

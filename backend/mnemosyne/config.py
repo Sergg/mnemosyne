@@ -20,7 +20,7 @@ from typing import Literal
 
 import tomli_w
 from dotenv import load_dotenv
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -66,6 +66,7 @@ SECRET_FIELDS = frozenset(
         "hubspot_token",
         "slack_webhook_url",
         "matrix_access_token",
+        "publish_host_token",
     }
 )
 
@@ -273,6 +274,30 @@ class Settings(BaseSettings):
     # Relays for remote access, comma-separated (e.g. https://relay.example.org, an iroh-relay
     # you run). Blank: n0's free public relays. Paired computers follow home's choice.
     remote_relays: str = ""
+    # Publishing a meeting (services/publishing.py, docs/plans/2026-10-12-hashseq-collaboration.md
+    # phase 7): a curated, encrypted copy readers open with a link. publish_host: the address of
+    # a publish host (publish-host/, e.g. https://pub.example.org); blank = none, so meetings can
+    # only be published from this computer. publish_host_token: the upload token a closed host
+    # asks for (X-Upload-Token); blank for an open host.
+    publish_host: str = ""
+    publish_host_token: str = ""
+    # Team servers only: members (owners) and admins may publish meetings only once an admin
+    # turns this on. The desktop app always may (publishing.allowed).
+    allow_publishing: bool = False
+    # How long a new publication stays up, in days (a publish host keeps one at most 365).
+    publish_default_expiry_days: int = 90
+    # Guest notes (phase 9): a live notes room outsiders join with a link. guest_host: a publish
+    # host that serves rooms; blank = publish_host, else ours once it runs. Team servers: off
+    # until an admin turns allow_guest_notes on. guest_notes_end_hours: how long after the
+    # recording stops a room is ended.
+    guest_host: str = ""
+    allow_guest_notes: bool = False
+    guest_notes_end_hours: int = 12
+    # How guest notes reach guests: auto = iroh to this computer, else a tunnel, else a publish
+    # host. guest_page_url: where the guest page is served from; blank = the default GitHub
+    # Pages copy.
+    guest_transport: Literal["auto", "iroh", "tunnel", "host"] = "auto"
+    guest_page_url: str = ""
 
     # Calendar: private ICS address (or a local .ics path). Recordings started during
     # a meeting are named after it and remember its attendees.
@@ -390,6 +415,25 @@ class Settings(BaseSettings):
     # Every export also rewrites <subfolder>/Decisions.md: the decisions of all meetings, newest
     # first, each under a link to its note (export/topic_notes.py).
     obsidian_decisions_log: bool = False
+    # Meetings other people shared with you (phase 8) stay out of these unless turned on: Ask,
+    # the semantic search index (keyword search always finds them), the weekly digest, and
+    # Obsidian (meeting notes, export-all, the decisions log, person notes, vault ticks).
+    shared_in_ask: bool = False
+    shared_in_search: bool = False
+    shared_in_digest: bool = False
+    shared_in_obsidian: bool = False
+
+    @field_validator("publish_default_expiry_days")
+    @classmethod
+    def _clamp_expiry(cls, v: int) -> int:
+        return max(1, min(365, v))
+
+    @field_validator("guest_notes_end_hours")
+    @classmethod
+    def _end_hours(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("guest_notes_end_hours must be at least 1")
+        return v
 
     @classmethod
     def settings_customise_sources(

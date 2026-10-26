@@ -52,6 +52,7 @@ class SyncPeer:
     last_sync_at: str | None = None
     since: int = 0  # the peer's change counter this machine has pulled up to
     listen: str | None = None  # the sidecar's loopback address for it, when dialed
+    provisional: bool = False  # `id` is a stand-in until the peer's hello states its own
 
 
 def now_iso() -> str:
@@ -79,6 +80,8 @@ class SyncPeerStore:
         known = {f.name for f in fields(SyncPeer)}
         for p in raw.get("peers", []):
             peer = SyncPeer(**{k: v for k, v in p.items() if k in known})
+            if "provisional" not in p and peer.id == peer.endpoint_id[:12]:
+                peer.provisional = True  # saved before the flag: a stand-in id (only these)
             self._peers[peer.id] = peer
         if not me.get("id"):
             self.save()
@@ -112,10 +115,36 @@ class SyncPeerStore:
         return next((p for p in self._peers.values() if p.endpoint_id == endpoint_id), None)
 
     def add(self, peer: SyncPeer) -> SyncPeer:
-        """Record a peer, replacing one with the same id or the same endpoint (paired again)."""
+        """Record a peer, replacing one with the same endpoint (paired again). An id already
+        bound to another endpoint, or our own id, is refused: the id is stated by the peer, so
+        it must not take over another peer's record (token included)."""
+        if peer.id == self._self.id:
+            raise SyncPairingError("That computer claims this computer's sync id")
+        held = self._peers.get(peer.id)
+        if held is not None and held.endpoint_id != peer.endpoint_id:
+            raise SyncPairingError(
+                f"Another computer already syncs as {held.name}: remove it first to pair this one"
+            )
         for old in [p for p in self._peers.values() if p.endpoint_id == peer.endpoint_id]:
             del self._peers[old.id]
         self._peers[peer.id] = peer
+        self.save()
+        return peer
+
+    def adopt_id(self, old_id: str, new_id: str) -> SyncPeer:
+        """A provisional peer's real id is known: re-key its record and clear `provisional`.
+        Refuses, as `add` does, our own id and an id held by another endpoint."""
+        peer = self._peers.get(old_id)
+        if peer is None or not peer.provisional:
+            raise SyncPairingError("That peer's id is not provisional")
+        if new_id == self._self.id:
+            raise SyncPairingError("That computer claims this computer's sync id")
+        held = self._peers.get(new_id)
+        if held is not None and held is not peer:
+            raise SyncPairingError(f"Another computer already syncs as {held.name}")
+        del self._peers[old_id]
+        peer.id, peer.provisional = new_id, False
+        self._peers[new_id] = peer
         self.save()
         return peer
 
@@ -213,13 +242,71 @@ async def fetch_peer_self(listen: str, token: str) -> dict:
         return r.json()["self"]
 
 
+async def adopt_person_key(ctx: AppContext, peer: SyncPeer, offer: object) -> str | None:
+    """B, after pairing: share the person key with A as A's reply said (`offer` is the reply's
+    `sync.person`: A's public key and who adopts: "mine" = this computer takes A's key, "yours" =
+    A takes ours, "same" = nothing). Returns None when done or when there was nothing to do (an
+    older A sends no offer), else why the key could not be shared. Pairing stays whatever
+    happens here: the next pairing can redo it."""
+    from . import contacts
+    from .person import PersonKeys
+
+    if not isinstance(offer, dict) or offer.get("adopt") not in ("mine", "yours", "same"):
+        return None
+    adopt, theirs = offer["adopt"], str(offer.get("pub") or "")
+    mine = ctx.person.public_hex
+    if adopt == "same" or theirs == mine:
+        return None
+    try:
+        if not peer.listen:
+            raise LinkError("it was not reachable")
+        async with ctx.sync.client_for(peer) as client:
+            if adopt == "mine":
+                if contacts.has_people_data(ctx):  # changed since we told A: keep our key
+                    raise SyncPairingError("this computer has contacts under its own key")
+                r = await client.get("/api/sync/person-key")
+                r.raise_for_status()
+                private = str(r.json()["private"])
+                if PersonKeys.public_of(private) != theirs:
+                    raise SyncPairingError("the key sent is not the one it announced")
+                ctx.person.replace(private)
+                contacts.on_key_changed(ctx)
+            else:
+                r = await client.put(
+                    "/api/sync/person-key", json={"private": ctx.person.export_private()}
+                )
+                r.raise_for_status()
+                if r.json().get("pid") != ctx.person.pid:
+                    raise SyncPairingError("it did not take this computer's key")
+    except Exception as e:  # noqa: BLE001 - pairing stays; the key is shared at the next pairing
+        reason = str(e) or type(e).__name__
+        if hasattr(e, "response"):
+            try:
+                reason = e.response.json().get("detail") or reason
+            except Exception:  # noqa: BLE001
+                pass
+        message = f"Paired, but the person key was not shared with {peer.name}: {reason}"
+        logger.warning(message)
+        return message
+    logger.info("Shared the person key with %s (%s)", peer.name, adopt)
+    return None
+
+
 async def pair_with_invite(
-    ctx: AppContext, invite: str, name: str = "", *, fetch_self=None
+    ctx: AppContext,
+    invite: str,
+    name: str = "",
+    *,
+    fetch_self=None,
+    outcome: dict | None = None,
 ) -> SyncPeer:
     """This machine is B: redeem the invite A showed. B trusts A's endpoint first (a DESKTOP
     device and the token A will use on B), then the sidecar pairs and hands A that token along
     with how to dial B back. A answers with the token for A and, when the sidecar relays it,
-    A's sync identity; both sides then dial each other."""
+    A's sync identity; both sides then dial each other. B also says which person key it has and
+    whether anything depends on it; A answers who adopts whose (`adopt_person_key`), and a failure
+    there is reported as `outcome["person_error"]`, not raised."""
+    from . import contacts
     from .link import endpoint_id_from_ticket
 
     check_can_pair(ctx)
@@ -245,6 +332,12 @@ async def pair_with_invite(
                 "ticket": ctx.link.status.ticket,
                 "token": token_for_a,
             },
+            card={
+                "person": {
+                    "pub": ctx.person.public_hex,
+                    "has_people_data": contacts.has_people_data(ctx),
+                }
+            },
         )
     except LinkError as e:
         ctx.pairing.revoke(device.id)
@@ -268,13 +361,22 @@ async def pair_with_invite(
             logger.warning("Could not ask the new sync peer who it is: %s", e)
     if not peer.id:
         peer.id = endpoint_id[:12]  # a stand-in until its sync id is known
+        peer.provisional = True
+    try:
+        ctx.sync_peers.add(peer)
+    except SyncPairingError:
+        ctx.pairing.revoke(device.id)
+        raise
     ctx.pairing.rename(device.id, peer.name)
-    ctx.sync_peers.add(peer)
     try:
         await dial(ctx.link, ctx.sync_peers, peer)
     except LinkError as e:
         logger.warning("Could not dial sync peer %s yet: %s", peer.name, e)
-    return ctx.sync_peers.get(peer.id) or peer
+    stored = ctx.sync_peers.get(peer.id) or peer
+    error = await adopt_person_key(ctx, stored, their.get("person"))
+    if outcome is not None:
+        outcome["person_error"] = error
+    return stored
 
 
 async def record_incoming(

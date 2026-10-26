@@ -26,7 +26,10 @@ it is shown with its quote and never deleted on its own.
 
 Who may do what (team server, access.py): anyone who can read the meeting comments; authors edit
 their own; the author, the meeting's owner or an admin deletes; the meeting's owner, an admin or
-the thread's author resolves and reopens. On the desktop (nobody signed in) everything is allowed.
+the thread's author resolves and reopens. On the desktop (nobody signed in) everything is allowed,
+except on a meeting someone shared with me (phase 8, services/shared_with_me.py): there I act as
+myself as the owner's hub knows me (`contacts.my_principal`, a member who does not own it), and
+only on the parts shared with me, the same rules the hub applies when it takes the comment.
 """
 
 from __future__ import annotations
@@ -42,8 +45,10 @@ from uuid import uuid4
 from .. import access
 from ..models.comment import Comment, CommentCreate, CommentThread, SessionComments
 from ..models.session import Session, SummaryData
+from ..models.shared_meeting import ShareParts
 from ..models.transcript import TranscriptSegment
-from . import history, shared_notes
+from . import history, share_push, shared_notes, shared_with_me
+from .contacts import pid_of
 from .parts import offsets, part_of
 from .summary_doc import section
 
@@ -56,6 +61,11 @@ MIN_OVERLAP = 0.5  # of the comment's span, or of the line's own duration
 NEAR = 5.0  # seconds: a moment between lines is on the nearest line this close
 FUZZY = 0.85  # difflib ratio for summary text that was reworded
 EXCERPT = 80  # characters of a comment in the meeting's history
+
+
+# (author id, author name) of someone who is not a signed-in user: a guest of the live notes,
+# whose comments the owner's bridge writes.
+Actor = tuple[str, str]
 
 
 class BadComment(ValueError):
@@ -82,9 +92,16 @@ def excerpt(text: str, limit: int = EXCERPT) -> str:
 # ---- who ---------------------------------------------------------------------------------
 
 
-def _author(app: AppContext) -> tuple[str, str]:
-    """(author id, name): the signed-in person, or on the desktop "" and the microphone's name."""
-    p = access.principal()
+def _author(
+    app: AppContext, session: Session | None = None, actor: Actor | None = None
+) -> tuple[str, str]:
+    """(author id, name): the signed-in person, or on the desktop "" and the microphone's name;
+    on a meeting shared with me, my `p:` id and name (shared_with_me.acting). An explicit
+    `actor` (a guest of the notes, phase 9: ("guest:<gid>", "<name> (guest)")) is its own
+    author."""
+    if actor is not None:
+        return actor
+    p = shared_with_me.acting(app, session) if session is not None else access.principal()
     if p is not None:
         return p.user_id, p.name
     return "", (app.settings.local_speaker_name or "").strip() or "You"
@@ -376,6 +393,10 @@ class _Meeting:
     owner: str
     principal: access.Principal | None
     app: AppContext
+    owns: bool = True  # the principal may change the meeting (its owner, an admin)
+    parts: ShareParts | None = None  # a meeting shared with me: what of it was
+    sharer_pid: str = ""  # ... and its owner's `p:` id
+    actor: bool = False  # the principal is an explicit actor (a guest), not a signed-in user
     _marks: tuple[str, dict] | None = None  # the notes' plain text and comment ranges
     _marks_read: bool = False
 
@@ -385,14 +406,31 @@ class _Meeting:
         return self._marks
 
     @classmethod
-    def of(cls, app: AppContext, session: Session) -> _Meeting:
+    def of(cls, app: AppContext, session: Session, actor: Actor | None = None) -> _Meeting:
+        """The meeting as `actor` sees it: a plain member of its comments (never its owner,
+        never an admin), whatever the request context is."""
+        owner = app.repo.session_owner(session.id) or ""
+        shared = session.shared_from
         return cls(
             session=session,
             starts=offsets(session),
-            owner=app.repo.session_owner(session.id) or "",
-            principal=access.principal(),
+            owner=owner,
+            principal=(
+                access.Principal(actor[0], actor[1], access.MEMBER)
+                if actor is not None
+                else shared_with_me.acting(app, session)
+            ),
             app=app,
+            # Someone else's meeting shared with me is never mine to moderate.
+            owns=actor is None and not shared and access.can_write(owner),
+            parts=shared_with_me.parts_of(app, session.id, shared) if shared else None,
+            sharer_pid=pid_of(shared) if shared else "",
+            actor=actor is not None,
         )
+
+    def require_part(self, target: str) -> None:
+        """On a meeting shared with me: Forbidden unless the target's part was shared."""
+        shared_with_me.require_part(self.parts, shared_with_me.COMMENT_PART.get(target))
 
     def rights(self, c: Comment, root_author: str) -> tuple[bool, bool, bool]:
         """(can_edit, can_delete, can_resolve)."""
@@ -402,16 +440,20 @@ class _Meeting:
             return not c.deleted, not c.deleted, root
         admin = p.role == access.ADMIN
         mine = bool(c.author_id) and c.author_id == p.user_id
-        owns = access.can_write(self.owner)
+        owns = self.owns
         thread_mine = bool(root_author) and root_author == p.user_id
         return (
             not c.deleted and (mine or admin),
             not c.deleted and (mine or owns),
-            root and (owns or thread_mine),
+            # Resolving stays with the owner: a guest's own thread is theirs to read only.
+            root and (owns or (thread_mine and not self.actor)),
         )
 
     def view(self, c: Comment, root_author: str | None = None) -> Comment:
         out = c.model_copy()
+        if self.sharer_pid and not c.author_id:
+            # On a meeting shared with me no author id is its owner's (never mine, "You").
+            out.author_id = self.sharer_pid
         s = self.session
         if not c.parent_id and not c.deleted:
             if c.target == "segment":
@@ -480,9 +522,11 @@ def _publish(app: AppContext, session_id: str, mentions: list[str] | None = None
     app.bus.publish({"type": "comments", "session_id": session_id, "mentions": mentions or []})
 
 
-def _view_one(app: AppContext, session_id: str, comment_id: str) -> Comment:
+def _view_one(
+    app: AppContext, session_id: str, comment_id: str, actor: Actor | None = None
+) -> Comment:
     c = _get(app, session_id, comment_id)
-    meeting = _Meeting.of(app, _session(app, session_id))
+    meeting = _Meeting.of(app, _session(app, session_id), actor)
     root_author = c.author_id
     if c.parent_id:
         root = app.repo.get_comment(c.parent_id)
@@ -493,27 +537,59 @@ def _view_one(app: AppContext, session_id: str, comment_id: str) -> Comment:
 # ---- writing -----------------------------------------------------------------------------
 
 
-def create(app: AppContext, session_id: str, req: CommentCreate) -> Comment:
+COMMENT_ID = re.compile(r"[0-9a-f]{12}")
+
+
+def create(
+    app: AppContext,
+    session_id: str,
+    req: CommentCreate,
+    comment_id: str = "",
+    actor: Actor | None = None,
+) -> Comment:
+    """A new comment or reply by the caller, or by `actor` when given (a guest of the notes:
+    (author id, name), written by the owner's bridge). `comment_id`: one the client minted (a
+    contact's computer, phase 8: it shows the comment before the hub has it); an id already
+    used is refused unless it is this same author's comment in this meeting (sent twice),
+    which is returned as it is."""
     session = _session(app, session_id)
     text = req.text.strip()
     if not text:
         raise BadComment("A comment needs text")
     fields: dict = {}
-    comment_id = uuid4().hex[:12]  # known first: a notes comment's mark carries it
+    if comment_id:
+        if not COMMENT_ID.fullmatch(comment_id):
+            raise BadComment("A comment id is 12 hex characters")
+        try:
+            existing = app.repo.get_comment(comment_id)
+        except access.Hidden:
+            raise BadComment("That comment id is taken") from None
+        if existing is not None:
+            if (
+                existing.session_id == session_id
+                and existing.author_id == _author(app, session, actor)[0]
+            ):
+                return _view_one(app, session_id, comment_id, actor)
+            raise BadComment("That comment id is taken")
+    else:
+        comment_id = uuid4().hex[:12]  # known first: a notes comment's mark carries it
+    parts = shared_with_me.parts_of(app, session_id, session.shared_from)
     if req.parent_id:
         parent = app.repo.get_comment(req.parent_id)
         if parent is None or parent.session_id != session_id:
             raise BadComment("No such thread in this meeting")
         if parent.parent_id:
             raise BadComment("Reply to the thread's first comment")
+        shared_with_me.require_part(parts, shared_with_me.COMMENT_PART.get(parent.target))
         fields["parent_id"] = parent.id
         target = parent.target
     else:
+        shared_with_me.require_part(parts, shared_with_me.COMMENT_PART.get(req.target))
         if req.target == "notes" and not shared_notes.available():
             raise NotesNotShared("The notes are not shared on this server")
         target, target_id, anchor, quote = _anchor(session, req, comment_id)
         fields.update(target=target, target_id=target_id, anchor=anchor, quote=quote)
-    author_id, author = _author(app)
+    author_id, author = _author(app, session, actor)
     mentions = parse_mentions(app, text)
     comment_id = app.repo.add_comment(
         session_id,
@@ -533,8 +609,12 @@ def create(app: AppContext, session_id: str, req: CommentCreate) -> Comment:
         reply=bool(req.parent_id),
         excerpt=excerpt(text),
     )
+    if session.shared_from:  # on its way to the owner (services/share_push.py)
+        share_push.enqueue_comment(
+            app, session_id, "create", {"comment_id": comment_id, **req.model_dump(mode="json")}
+        )
     _publish(app, session_id, mentions)
-    return _view_one(app, session_id, comment_id)
+    return _view_one(app, session_id, comment_id, actor)
 
 
 async def create_marked(app: AppContext, session_id: str, req: CommentCreate) -> Comment:
@@ -547,19 +627,24 @@ async def create_marked(app: AppContext, session_id: str, req: CommentCreate) ->
     ids = [i.strip() for i in req.notes_ids]
     if len(ids) != 2 or not all(ids):
         return c
-    author_id, author = _author(app)
+    author_id, author = _author(app, _session(app, session_id))
     if await shared_notes.mark_comment(app, session_id, c.id, ids[0], ids[1], author_id, author):
+        share_push.notes_typed(app, session_id)  # my mark on a meeting shared with me goes back
         _publish(app, session_id)  # the ranges are known now
         return _view_one(app, session_id, c.id)
     return c
 
 
-def _check(app: AppContext, session_id: str, c: Comment, what: str) -> None:
-    meeting = _Meeting.of(app, _session(app, session_id))
-    root_author = c.author_id
+def _check(
+    app: AppContext, session_id: str, c: Comment, what: str, actor: Actor | None = None
+) -> None:
+    meeting = _Meeting.of(app, _session(app, session_id), actor)
+    root_author, target = c.author_id, c.target
     if c.parent_id:
         root = app.repo.get_comment(c.parent_id)
         root_author = root.author_id if root is not None else ""
+        target = root.target if root is not None else c.target
+    meeting.require_part(target)
     can_edit, can_delete, can_resolve = meeting.rights(c, root_author)
     allowed = {"edit": can_edit, "delete": can_delete, "resolve": can_resolve}[what]
     if not allowed:
@@ -572,25 +657,28 @@ def _check(app: AppContext, session_id: str, c: Comment, what: str) -> None:
         )
 
 
-def edit(app: AppContext, session_id: str, comment_id: str, text: str) -> Comment:
+def edit(
+    app: AppContext, session_id: str, comment_id: str, text: str, actor: Actor | None = None
+) -> Comment:
     c = _get(app, session_id, comment_id)
     if c.deleted:
         raise CommentNotFound("Comment not found")
-    _check(app, session_id, c, "edit")
+    _check(app, session_id, c, "edit", actor)
     text = text.strip()
     if not text:
         raise BadComment("A comment needs text (delete it instead)")
     mentions = parse_mentions(app, text)
     app.repo.update_comment_text(comment_id, text, mentions)
+    share_push.enqueue_comment(app, session_id, "edit", {"comment_id": comment_id, "text": text})
     _publish(app, session_id, [m for m in mentions if m not in c.mentions])
-    return _view_one(app, session_id, comment_id)
+    return _view_one(app, session_id, comment_id, actor)
 
 
-def delete(app: AppContext, session_id: str, comment_id: str) -> None:
+def delete(app: AppContext, session_id: str, comment_id: str, actor: Actor | None = None) -> None:
     c = _get(app, session_id, comment_id)
     if c.deleted:
         raise CommentNotFound("Comment not found")
-    _check(app, session_id, c, "delete")
+    _check(app, session_id, c, "delete", actor)
     app.repo.delete_comment(comment_id)
     if c.parent_id:
         # The last reply under a deleted first comment takes the empty thread with it.
@@ -598,6 +686,7 @@ def delete(app: AppContext, session_id: str, comment_id: str) -> None:
         if root is not None and root.deleted:
             if not any(x.parent_id == root.id for x in app.repo.list_comments(session_id)):
                 app.repo.delete_comment(root.id)
+    share_push.enqueue_comment(app, session_id, "delete", {"comment_id": comment_id})
     _publish(app, session_id)
 
 
@@ -608,7 +697,7 @@ def _resolve(app: AppContext, session_id: str, comment_id: str, resolved: bool) 
     _check(app, session_id, c, "resolve")
     if (c.resolved_at is not None) == resolved:
         return _view_one(app, session_id, comment_id)
-    _, by = _author(app)
+    _, by = _author(app, _session(app, session_id))
     app.repo.set_comment_resolved(comment_id, datetime.now() if resolved else None, by)
     history.log(
         app,
@@ -617,6 +706,9 @@ def _resolve(app: AppContext, session_id: str, comment_id: str, resolved: bool) 
         by=by,
         target=c.target,
         excerpt=excerpt(c.text or c.quote),
+    )
+    share_push.enqueue_comment(
+        app, session_id, "resolve" if resolved else "reopen", {"comment_id": comment_id}
     )
     _publish(app, session_id)
     return _view_one(app, session_id, comment_id)

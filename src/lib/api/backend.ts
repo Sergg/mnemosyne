@@ -39,6 +39,12 @@ import type {
   Thread,
   PhoneLink,
   PairingCode,
+  ContactInfo,
+  ContactsResponse,
+  ContactPullInfo,
+  ShareParts,
+  PeerShareInfo,
+  ShareStatus,
   PairedDevice,
   RemoteAccess,
   SyncStatus,
@@ -48,6 +54,11 @@ import type {
   IssueResult,
   HubSpotMatches,
   HubSpotPushResult,
+  Publication,
+  GuestRoom,
+  PublicationDefaults,
+  PublicationListItem,
+  PublicationSelection,
   HubSpotState,
   RepoCheck,
   Level,
@@ -822,8 +833,53 @@ export async function getPhoneLink(): Promise<PhoneLink> {
 
 /** A one-time pairing code: for a phone, the phone page addresses carrying it; for a computer,
  * the invite to paste on it (needs remote access running). */
-export async function createPairingCode(kind: 'phone' | 'desktop' | 'sync' = 'phone'): Promise<PairingCode> {
+export async function createPairingCode(kind: 'phone' | 'desktop' | 'sync' | 'contact' = 'phone'): Promise<PairingCode> {
   return request('/api/pairing/codes', { method: 'POST', body: JSON.stringify({ kind }) });
+}
+
+// ---- Sharing with people (contacts and per-meeting shares) -------------------------------------
+
+export async function getContacts(): Promise<ContactsResponse> {
+  return request('/api/contacts');
+}
+
+/** A one-time contact code; `invite` is what the other person pastes in their app. */
+export async function createContactCode(): Promise<PairingCode> {
+  return request('/api/contacts/codes', { method: 'POST' });
+}
+
+export async function pairContact(invite: string): Promise<ContactInfo> {
+  return request('/api/contacts/pair', { method: 'POST', body: JSON.stringify({ invite }) });
+}
+
+/** An empty name goes back to the one on their card. */
+export async function renameContact(person: string, name: string): Promise<ContactInfo> {
+  return request(`/api/contacts/${person}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+}
+
+export async function removeContact(person: string): Promise<void> {
+  await request(`/api/contacts/${person}`, { method: 'DELETE' });
+}
+
+export async function pullContact(person: string): Promise<ContactPullInfo> {
+  return request(`/api/contacts/${person}/pull`, { method: 'POST' });
+}
+
+export async function getPeerShares(sessionId: string): Promise<PeerShareInfo[]> {
+  return request(`/api/sessions/${sessionId}/peer-shares`);
+}
+
+export async function putPeerShare(sessionId: string, person: string, parts: ShareParts): Promise<PeerShareInfo> {
+  return request(`/api/sessions/${sessionId}/peer-shares/${person}`, { method: 'PUT', body: JSON.stringify(parts) });
+}
+
+export async function removePeerShare(sessionId: string, person: string): Promise<void> {
+  await request(`/api/sessions/${sessionId}/peer-shares/${person}`, { method: 'DELETE' });
+}
+
+/** 404 when the meeting is not shared with this person. */
+export async function getShareStatus(sessionId: string): Promise<ShareStatus> {
+  return request(`/api/sessions/${sessionId}/share-status`);
 }
 
 export async function getRemoteAccess(): Promise<RemoteAccess> {
@@ -903,6 +959,18 @@ export async function listTasks(status: 'open' | 'done' | 'all' = 'all'): Promis
 /** Tick or star a whole task: every meeting that mentions it follows. */
 export async function updateTask(key: string, changes: { done?: boolean; follow?: boolean }): Promise<TaskObject> {
   return request(`/api/tasks/${encodeURIComponent(key)}`, { method: 'PATCH', body: JSON.stringify(changes) });
+}
+
+/** Change an action item typed in the notes: done, follow or due (null clears it). Text and owner change in the notes. */
+export async function updateNotesItem(
+  sessionId: string,
+  itemId: string,
+  changes: { done?: boolean; follow?: boolean; due?: string | null }
+): Promise<TaskItem> {
+  return request(`/api/sessions/${sessionId}/notes-items/${encodeURIComponent(itemId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(changes)
+  });
 }
 
 type ItemRef = { session_id: string; item_id: string };
@@ -1182,4 +1250,93 @@ export async function postTaskComment(key: string, text: string, parentId = ''):
     method: 'POST',
     body: JSON.stringify({ text, parent_id: parentId })
   });
+}
+
+// Guest notes: a room on the publish host where people with a link edit the meeting's notes.
+const guestPath = (sessionId: string) => `/api/sessions/${encodeURIComponent(sessionId)}/guest-notes`;
+
+export async function getGuestNotes(sessionId: string): Promise<GuestRoom | null> {
+  return request(guestPath(sessionId));
+}
+
+export async function startGuestNotes(sessionId: string): Promise<GuestRoom> {
+  return request(guestPath(sessionId), { method: 'PUT' });
+}
+
+export async function endGuestNotes(sessionId: string): Promise<GuestRoom> {
+  return request(`${guestPath(sessionId)}/end`, { method: 'POST' });
+}
+
+export async function newGuestLink(sessionId: string): Promise<GuestRoom> {
+  return request(`${guestPath(sessionId)}/new-link`, { method: 'POST' });
+}
+
+export async function stopGuestNotes(sessionId: string): Promise<GuestRoom | null> {
+  return request(guestPath(sessionId), { method: 'DELETE' });
+}
+
+// Publishing a meeting (backend routes/publishing.py): a curated, encrypted copy readers open
+// with a link, or one HTML file.
+export async function getPublication(sessionId: string): Promise<Publication | null> {
+  return request(`/api/sessions/${sessionId}/publication`);
+}
+
+export async function getPublicationDefaults(sessionId: string): Promise<PublicationDefaults> {
+  return request(`/api/sessions/${sessionId}/publication/defaults`);
+}
+
+/** The manifest readers would get, unsealed (viewer/src/format.ts `Manifest`), except that a
+ * quote's clip is `{preview_url, seconds, mime}`. */
+export async function previewPublication(sessionId: string, selection: PublicationSelection): Promise<unknown> {
+  return request(`/api/sessions/${sessionId}/publication/preview`, {
+    method: 'POST',
+    body: JSON.stringify(selection)
+  });
+}
+
+/** Publish, or update the live publication: a `publish` job whose result is {publication}. */
+export async function publishSession(sessionId: string, selection: PublicationSelection): Promise<Job> {
+  return request(`/api/sessions/${sessionId}/publication`, { method: 'PUT', body: JSON.stringify(selection) });
+}
+
+export async function unpublishSession(sessionId: string): Promise<Publication> {
+  return request(`/api/sessions/${sessionId}/publication`, { method: 'DELETE' });
+}
+
+export async function listPublications(): Promise<PublicationListItem[]> {
+  return request('/api/publications');
+}
+
+/** One HTML file: a `publication_file` job whose result is {token, filename, size}. */
+export async function startPublicationFile(
+  sessionId: string,
+  selection: PublicationSelection,
+  password: string | null
+): Promise<Job> {
+  return request(`/api/sessions/${sessionId}/publication/file`, {
+    method: 'POST',
+    body: JSON.stringify({ selection, password })
+  });
+}
+
+/** Where to fetch a made file (once: it is deleted after the download), token included. */
+export function publicationFileUrl(sessionId: string, token: string): string {
+  return connectionState.withToken(`${base()}/api/sessions/${sessionId}/publication/file/${encodeURIComponent(token)}`);
+}
+
+/** Write a made file to a path the desktop app's save dialog chose (the backend deletes it). */
+export async function savePublicationFile(sessionId: string, token: string, path: string): Promise<{ path: string }> {
+  return request(`/api/sessions/${sessionId}/publication/file/${token}/save`, {
+    method: 'POST',
+    body: JSON.stringify({ path })
+  });
+}
+
+/** A backend-relative URL (e.g. a preview clip's `/api/audio/file/<id>#t=1,2`) made absolute,
+ * with the token before the media fragment so the fragment still reaches the player. */
+export function backendMediaUrl(path: string): string {
+  const hash = path.indexOf('#');
+  const head = hash < 0 ? path : path.slice(0, hash);
+  const frag = hash < 0 ? '' : path.slice(hash);
+  return connectionState.withToken(`${base()}${head}`) + frag;
 }

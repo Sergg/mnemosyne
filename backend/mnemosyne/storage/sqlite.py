@@ -6,6 +6,7 @@ table so listing sessions never deserializes transcripts.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -13,7 +14,7 @@ import sqlite3
 import threading
 from collections import Counter
 from collections.abc import Callable
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -29,21 +30,38 @@ from ..models.session import (
     Bookmark,
     CopilotNotes,
     ExternalNotes,
+    NotesItem,
     Recording,
     Session,
     SessionStatus,
     SessionSummary,
     SummaryData,
 )
+from ..models.shared_meeting import SharedMeeting
 from ..models.speaker import SpeakerProfile
-from ..models.sync_session import SyncSession, event_travels
+from ..models.sync_session import SyncPeerShare, SyncSession, event_travels, peer_share_rank
 from ..models.transcript import TranscriptSegment
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 17
+
+# guest_rooms columns added after phase 9 (additive migration in `_migrate_columns`).
+_GUEST_ROOM_ADDED = (
+    ("transport", "TEXT NOT NULL DEFAULT 'host'"),
+    ("endpoint_id", "TEXT NOT NULL DEFAULT ''"),
+    ("relay", "TEXT NOT NULL DEFAULT ''"),
+    ("public_url", "TEXT NOT NULL DEFAULT ''"),
+    ("mirror_host_url", "TEXT NOT NULL DEFAULT ''"),
+    ("mirror_token", "TEXT NOT NULL DEFAULT ''"),
+    ("mirror_last_seq", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 # Fields of a meeting that do not travel in library sync: changing only these is no new version.
+# Meta key prefix of the last of my notes frames the owner accepted, per meeting shared with me.
+PUSHED_SEQ_PREFIX = "share_pushed_seq:"
+REFUSED_NOTES_PREFIX = "share_notes_refused:"  # ... and why the owner refused them
+
 LOCAL_FIELDS = frozenset({"status", "audio_file"})
 
 # The search index follows its tables by rowid: an index row has the rowid of the row it
@@ -419,6 +437,59 @@ CREATE TABLE IF NOT EXISTS deletions (
     role TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT ''
 );
+-- Publications (services/publishing.py): a meeting's curated, encrypted copy, readable with a
+-- link that carries `key`. `token` authorizes updates on a publish host; `place` is "local" or
+-- "host"; selection, clip_blobs (span -> sealed clip, reused by later versions) are JSON;
+-- published_digest is a hash of what the last version showed (`behind`). One live (not
+-- unpublished) row per meeting. A change here is a new version of the meeting for library sync
+-- (the row travels in SyncSession.publications); `origin` is the computer whose files serve a
+-- "local" publication ('' = this one, else its sync id).
+CREATE TABLE IF NOT EXISTS publications (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    key BLOB NOT NULL,
+    token TEXT NOT NULL,
+    place TEXT NOT NULL,
+    host_url TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL,
+    selection TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT,
+    unpublished_at TEXT,
+    clip_blobs TEXT NOT NULL DEFAULT '{}',
+    published_digest TEXT NOT NULL DEFAULT '',
+    published_by TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS publications_session ON publications(session_id);
+CREATE UNIQUE INDEX IF NOT EXISTS publications_live ON publications(session_id)
+    WHERE unpublished_at IS NULL;
+-- Guest notes rooms (phase 9): one per meeting. `key` is the room's secret, `token` the
+-- publisher token on the host, `room_token` the room's own token. Belongs to the machine that
+-- started it: never travels in library sync and is not a new version of the meeting.
+CREATE TABLE IF NOT EXISTS guest_rooms (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    room TEXT NOT NULL,
+    key BLOB NOT NULL,
+    token TEXT NOT NULL,
+    room_token TEXT NOT NULL,
+    host_url TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_by TEXT NOT NULL DEFAULT '',
+    ended_at TEXT NOT NULL DEFAULT '',
+    deleted_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    auto_end_at TEXT NOT NULL DEFAULT '',
+    last_seq INTEGER NOT NULL DEFAULT 0,
+    transport TEXT NOT NULL DEFAULT 'host',
+    endpoint_id TEXT NOT NULL DEFAULT '',
+    relay TEXT NOT NULL DEFAULT '',
+    public_url TEXT NOT NULL DEFAULT '',
+    mirror_host_url TEXT NOT NULL DEFAULT '',
+    mirror_token TEXT NOT NULL DEFAULT '',
+    mirror_last_seq INTEGER NOT NULL DEFAULT 0
+);
 -- Library sync (services/sync): the states served to each peer, the last few per meeting (the
 -- base of a three-way merge), and meetings deleted. No foreign key: a tombstone outlives its
 -- meeting, that is its job.
@@ -436,6 +507,83 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
     device TEXT NOT NULL,
     name TEXT NOT NULL
 );
+-- Contacts (services/contacts.py): other people's keys, global to the library, not meeting data.
+-- `card` is their signed card, `secret` the pair's shared secret, `machines` runtime state per
+-- endpoint (the dialed loopback address), `cursors` pull cursors per endpoint. A removed
+-- contact keeps its row (removed_at) so the removal can travel in library sync.
+CREATE TABLE IF NOT EXISTS contacts (
+    person TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    my_name TEXT NOT NULL DEFAULT '',
+    card TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    machines TEXT NOT NULL DEFAULT '{}',
+    cursors TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    removed_at TEXT NOT NULL DEFAULT ''
+);
+-- Meetings shared with a contact (phase 8; services/shares.py): `person` is the contact's key,
+-- `parts` the chosen parts as JSON. A revoked share keeps its row (`revoked_at`) so the
+-- revocation travels in library sync and reaches the contact as a tombstone.
+CREATE TABLE IF NOT EXISTS peer_shares (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    person TEXT NOT NULL,
+    parts TEXT NOT NULL,
+    by TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revoked_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, person)
+);
+CREATE INDEX IF NOT EXISTS peer_shares_person ON peer_shares(person);
+-- Who had a share of a meeting when it was deleted: the cascade removes peer_shares, and the
+-- contact still has to be told. Local bookkeeping, not synced (each machine tells its own).
+CREATE TABLE IF NOT EXISTS peer_share_tombstones (
+    session_id TEXT NOT NULL,
+    person TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (session_id, person)
+);
+-- Signatures over a subject (a record id or a frame hash): who signed, and the signature.
+-- Also the idempotency check for contributions that arrive twice.
+CREATE TABLE IF NOT EXISTS signatures (
+    subject TEXT PRIMARY KEY,
+    signer TEXT NOT NULL,
+    sig TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+-- A meeting someone shared with this person, as last received (services/share_pull.py): the
+-- sharer's key, the parts they chose (JSON), the SharedMeeting's digest (an equal one is not
+-- applied again) and who else it is shared with (JSON list of names). Local, never synced.
+CREATE TABLE IF NOT EXISTS shared_meetings (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    person TEXT NOT NULL,
+    parts TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    shared_with TEXT NOT NULL DEFAULT '[]',
+    received_at TEXT NOT NULL
+);
+
+-- What I did on a meeting someone shared with me, waiting to be sent to its owner's computer
+-- (services/share_push.py): `id` is the signed record's id (a resend is the same record), `person`
+-- the owner. Comments and action-item flags only; my typed notes frames are read from the notes
+-- log past a per-meeting cursor (meta `share_pushed_seq:<session>`). status: pending | accepted |
+-- rejected (`reason` says why). Local, never synced.
+CREATE TABLE IF NOT EXISTS share_outbox (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    person TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    frame_hashes TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',
+    pushed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_share_outbox_session ON share_outbox(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_share_outbox_person ON share_outbox(person, status);
 """
 SCHEMA = SCHEMA.replace("{FTS_TRIGGERS}", FTS_TRIGGERS).replace("{COMMENT_FTS}", COMMENT_FTS)
 
@@ -535,6 +683,27 @@ def _asset(r) -> Asset:
     )
 
 
+def _notes_items(raw: str | None) -> list[NotesItem]:
+    """`sessions.notes_items` read back; an unreadable entry is skipped (they are derived again
+    at the next fold)."""
+    try:
+        data = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    out: list[NotesItem] = []
+    for d in data if isinstance(data, list) else []:
+        try:
+            out.append(NotesItem.model_validate(d))
+        except ValueError:
+            continue
+    return out
+
+
+def _local_naive(dt: datetime) -> datetime:
+    """Local meetings store naive local times; a timezone-aware one (shared in) becomes the same."""
+    return dt.astimezone().replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 class SessionRepository:
     def __init__(self, db_path: Path, key: bytes | None = None):
         self._lock = threading.RLock()
@@ -585,6 +754,11 @@ class SessionRepository:
             )
         if "copilot_notes" not in cols:
             self._conn.execute("ALTER TABLE sessions ADD COLUMN copilot_notes TEXT")
+        # Guest notes without a host (phase 10): how a room reaches guests, and its mirror.
+        room_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(guest_rooms)")}
+        for name, decl in _GUEST_ROOM_ADDED:
+            if name not in room_cols:
+                self._conn.execute(f"ALTER TABLE guest_rooms ADD COLUMN {name} {decl}")
         rec_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(recordings)")}
         if "part" not in rec_cols:
             self._conn.execute("ALTER TABLE recordings ADD COLUMN part INTEGER NOT NULL DEFAULT 0")
@@ -671,6 +845,34 @@ class SessionRepository:
         for col in ("plain", "comment_ranges"):
             if col not in notes_cols:
                 self._conn.execute(f"ALTER TABLE shared_notes ADD COLUMN {col} TEXT")
+        # A meeting someone shared WITH this person: the sharer's person key (64 hex); '' for
+        # our own meetings. Never travels in library sync (each computer pulls it from the owner).
+        if "shared_from" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN shared_from TEXT NOT NULL DEFAULT ''"
+            )
+        # Action items typed in the live notes (phase 11, services/notes_items.py): a JSON list
+        # of NotesItem, derived at each fold of the notes document.
+        if "notes_items" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN notes_items TEXT NOT NULL DEFAULT '[]'"
+            )
+        # Who may read a meeting beyond its owner: team-mode shares and live peer shares, as
+        # (session_id, user_id). A contact reads as the Principal "p:" + person[:16].
+        # Recreated on every open: the definition may change.
+        self._conn.execute("DROP VIEW IF EXISTS share_grants")
+        self._conn.execute(
+            "CREATE VIEW share_grants(session_id, user_id) AS"
+            " SELECT session_id, user_id FROM session_shares"
+            " UNION ALL"
+            " SELECT session_id, 'p:' || substr(person, 1, 16) FROM peer_shares"
+            " WHERE revoked_at = ''"
+        )
+        pub_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(publications)")}
+        if "origin" not in pub_cols:
+            self._conn.execute(
+                "ALTER TABLE publications ADD COLUMN origin TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.commit()
 
     def _migrate_fts_rowids(self) -> None:
@@ -724,6 +926,74 @@ class SessionRepository:
                 "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
             )
 
+    # ---- contacts (services/contacts.py); no meeting is touched ---------------------------
+
+    @staticmethod
+    def _contact(row) -> dict:
+        d = dict(row)
+        d["card"] = json.loads(d["card"])
+        d["machines"] = json.loads(d["machines"])
+        d["cursors"] = json.loads(d["cursors"])
+        return d
+
+    def contacts(self, include_removed: bool = False) -> list[dict]:
+        sql = "SELECT * FROM contacts"
+        if not include_removed:
+            sql += " WHERE removed_at=''"
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY created_at, person").fetchall()
+        return [self._contact(r) for r in rows]
+
+    def contact(self, person: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM contacts WHERE person=?", (person,)).fetchone()
+        return self._contact(row) if row else None
+
+    def put_contact(self, row: dict) -> None:
+        """Insert or replace a contact row (a dict as `contact()` returns it)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO contacts (person, name, my_name, card, secret, machines,"
+                " cursors, created_at, updated_at, removed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row["person"],
+                    row["name"],
+                    row.get("my_name", ""),
+                    json.dumps(row["card"], sort_keys=True),
+                    row["secret"],
+                    json.dumps(row.get("machines") or {}, sort_keys=True),
+                    json.dumps(row.get("cursors") or {}, sort_keys=True),
+                    row["created_at"],
+                    row["updated_at"],
+                    row.get("removed_at", ""),
+                ),
+            )
+
+    def remove_contact(self, person: str, at: str) -> bool:
+        """Mark a contact removed (the row stays, so the removal can travel)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE contacts SET removed_at=?, updated_at=? WHERE person=?", (at, at, person)
+            )
+        return cur.rowcount > 0
+
+    def set_contact_runtime(
+        self, person: str, machines: dict | None = None, cursors: dict | None = None
+    ) -> None:
+        """Replace a contact's per-machine runtime state and/or pull cursors (not a change that
+        travels: updated_at stays)."""
+        with self._lock, self._conn:
+            if machines is not None:
+                self._conn.execute(
+                    "UPDATE contacts SET machines=? WHERE person=?",
+                    (json.dumps(machines, sort_keys=True), person),
+                )
+            if cursors is not None:
+                self._conn.execute(
+                    "UPDATE contacts SET cursors=? WHERE person=?",
+                    (json.dumps(cursors, sort_keys=True), person),
+                )
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -776,9 +1046,7 @@ class SessionRepository:
         return None if row is None else row["owner_id"]
 
     # A member reads their own meetings and those shared with them, alone or with everyone.
-    _SEES = (
-        "(owner_id=? OR id IN (SELECT session_id FROM session_shares WHERE user_id IN (?, '*')))"
-    )
+    _SEES = "(owner_id=? OR id IN (SELECT session_id FROM share_grants WHERE user_id IN (?, '*')))"
     _SEES_S = _SEES.replace("(owner_id", "(s.owner_id").replace(" id IN", " s.id IN")  # sessions s
 
     def _readable(self, session_id: str) -> bool:
@@ -798,6 +1066,29 @@ class SessionRepository:
             if not self._readable(session_id):
                 raise access.Hidden("Session not found")
             raise access.Forbidden("This is someone else's meeting")
+        if not access.is_internal() and self._shared_from(session_id):
+            raise access.Forbidden(
+                f"Shared by {self._sharer_name(session_id)}: you can comment, tick action items"
+                " and type in the notes"
+            )
+
+    def shared_from(self, session_id: str) -> str:
+        """The sharer's key of a meeting shared with us; '' for our own or an unknown one."""
+        return self._shared_from(session_id)
+
+    def _shared_from(self, session_id: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT shared_from FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        return row["shared_from"] if row else ""
+
+    def _sharer_name(self, session_id: str) -> str:
+        person = self._shared_from(session_id)
+        contact = self.contact(person) if person else None
+        if contact is None:
+            return "someone"
+        return contact.get("my_name") or contact.get("name") or "someone"
 
     def visible_ids(self) -> set[str] | None:
         """The meetings the caller may see, or None for all of them."""
@@ -820,7 +1111,7 @@ class SessionRepository:
         sql = """
         SELECT s.id, s.name, s.status, s.created_at, s.updated_at, s.participants, s.local_only,
                length(s.summary) > 0 AS has_summary,
-               s.audio_file IS NOT NULL AS has_audio, s.owner_id, s.origin,
+               s.audio_file IS NOT NULL AS has_audio, s.owner_id, s.origin, s.shared_from,
                EXISTS(SELECT 1 FROM segments g WHERE g.session_id = s.id) AS has_transcript
         FROM sessions s {where} ORDER BY s.created_at DESC
         """
@@ -846,6 +1137,7 @@ class SessionRepository:
                 local_only=bool(r["local_only"]),
                 owner_id=r["owner_id"],
                 origin=r["origin"],
+                shared_from=r["shared_from"],
             )
             for r in rows
         ]
@@ -909,6 +1201,8 @@ class SessionRepository:
             owner_id=row["owner_id"],
             legal_hold=row["legal_hold"],
             origin=row["origin"],
+            shared_from=row["shared_from"],
+            notes_items=_notes_items(row["notes_items"]),
             assets=[_asset(r) for r in asset_rows],
             external_notes=[
                 ExternalNotes(
@@ -961,7 +1255,9 @@ class SessionRepository:
 
     def save(self, session: Session) -> Session:
         """Insert or fully replace a session including segments and recordings. A new meeting
-        belongs to whoever creates it (access.py); an existing one keeps its owner."""
+        belongs to whoever creates it (access.py); an existing one keeps its owner. Not
+        `notes_items`: they follow the notes document (services/notes_items.py), and a session
+        loaded before a fold must not put the old ones back."""
         self._check_write(session.id)
         owner = self._owner(session.id)
         session.owner_id = owner if owner is not None else (session.owner_id or access.user_id())
@@ -1729,6 +2025,206 @@ class SessionRepository:
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM summary_docs WHERE session_id=?", (session_id,))
 
+    # ---- publications (services/publishing.py; no access checks: the caller checks) -----
+
+    _PUB_COLS = (
+        "id, session_id, key, token, place, host_url, version, selection, created_at,"
+        " updated_at, expires_at, unpublished_at, clip_blobs, published_digest, published_by,"
+        " origin"
+    )
+
+    @staticmethod
+    def _publication(r: sqlite3.Row) -> dict:
+        row = dict(r)
+        row["key"] = bytes(row["key"])
+        row["selection"] = json.loads(row["selection"])
+        row["clip_blobs"] = json.loads(row["clip_blobs"] or "{}")
+        return row
+
+    def live_publication(self, session_id: str) -> dict | None:
+        """The meeting's publication that is not unpublished, as a dict of its columns."""
+        with self._lock:
+            r = self._conn.execute(
+                f"SELECT {self._PUB_COLS} FROM publications"
+                " WHERE session_id=? AND unpublished_at IS NULL",
+                (session_id,),
+            ).fetchone()
+        return None if r is None else self._publication(r)
+
+    def get_publication(self, pub_id: str) -> dict | None:
+        with self._lock:
+            r = self._conn.execute(
+                f"SELECT {self._PUB_COLS} FROM publications WHERE id=?", (pub_id,)
+            ).fetchone()
+        return None if r is None else self._publication(r)
+
+    def publications(self, live_only: bool = True) -> list[dict]:
+        where = " WHERE unpublished_at IS NULL" if live_only else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PUB_COLS} FROM publications{where} ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self._publication(r) for r in rows]
+
+    def session_publications(self, session_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._PUB_COLS} FROM publications WHERE session_id=?"
+                " ORDER BY created_at, id",
+                (session_id,),
+            ).fetchall()
+        return [self._publication(r) for r in rows]
+
+    @staticmethod
+    def _publication_values(row: dict) -> tuple:
+        return (
+            row["id"],
+            row["session_id"],
+            row["key"],
+            row["token"],
+            row["place"],
+            row.get("host_url", ""),
+            row["version"],
+            json.dumps(row["selection"]),
+            row["created_at"],
+            row["updated_at"],
+            row.get("expires_at"),
+            row.get("unpublished_at"),
+            json.dumps(row.get("clip_blobs") or {}),
+            row.get("published_digest", ""),
+            row.get("published_by", ""),
+            row.get("origin", ""),
+        )
+
+    _PUB_UPSERT = (
+        f"INSERT INTO publications ({_PUB_COLS}) VALUES ({','.join('?' * 16)})"
+        " ON CONFLICT(id) DO UPDATE SET "
+        + ", ".join(
+            f"{c.strip()}=excluded.{c.strip()}"
+            for c in _PUB_COLS.split(",")
+            if c.strip() not in ("id", "session_id")
+        )
+    )
+
+    def put_publication(self, row: dict) -> None:
+        """Insert or replace a publication (every column of `_PUB_COLS`). A new version of the
+        meeting for library sync (`_touch`): the row travels."""
+        with self._lock, self._conn:
+            self._conn.execute(self._PUB_UPSERT, self._publication_values(row))
+            self._touch(row["session_id"])
+
+    # ---- guest notes rooms (services/guest_notes.py; no access checks, no `_touch`) -----
+
+    _GUEST_COLS = (
+        "session_id, room, key, token, room_token, host_url, created_at, started_by, ended_at,"
+        " deleted_at, expires_at, auto_end_at, last_seq, transport, endpoint_id, relay, public_url,"
+        " mirror_host_url, mirror_token, mirror_last_seq"
+    )
+    _GUEST_FIELDS = frozenset(c.strip() for c in _GUEST_COLS.split(",")) - {"session_id"}
+
+    @staticmethod
+    def _guest_room(r: sqlite3.Row) -> dict:
+        row = dict(r)
+        row["key"] = bytes(row["key"])
+        return row
+
+    def guest_room(self, session_id: str) -> dict | None:
+        with self._lock:
+            r = self._conn.execute(
+                f"SELECT {self._GUEST_COLS} FROM guest_rooms WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return None if r is None else self._guest_room(r)
+
+    def put_guest_room(self, row: dict) -> None:
+        """Insert or replace the meeting's room (missing optional columns take their defaults)."""
+        defaults = {
+            "started_by": "",
+            "ended_at": "",
+            "deleted_at": "",
+            "expires_at": "",
+            "auto_end_at": "",
+            "last_seq": 0,
+            "transport": "host",
+            "endpoint_id": "",
+            "relay": "",
+            "public_url": "",
+            "mirror_host_url": "",
+            "mirror_token": "",
+            "mirror_last_seq": 0,
+        }
+        full = {**defaults, **row}
+        cols = [c.strip() for c in self._GUEST_COLS.split(",")]
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO guest_rooms ({self._GUEST_COLS})"
+                f" VALUES ({','.join('?' * len(cols))})",
+                tuple(full[c] for c in cols),
+            )
+
+    def live_guest_rooms(self) -> list[dict]:
+        """Rooms not deleted, ended ones included (they still need expiry handling)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._GUEST_COLS} FROM guest_rooms WHERE deleted_at=''"
+                " ORDER BY created_at, session_id"
+            ).fetchall()
+        return [self._guest_room(r) for r in rows]
+
+    def set_guest_room(self, session_id: str, **fields) -> None:
+        if not fields:
+            return
+        bad = set(fields) - self._GUEST_FIELDS
+        if bad:
+            raise ValueError(f"unknown guest room fields: {sorted(bad)}")
+        sets = ", ".join(f"{k}=?" for k in fields)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE guest_rooms SET {sets} WHERE session_id=?",
+                (*fields.values(), session_id),
+            )
+
+    def mark_unpublished(self, pub_id: str, at: str, *, touch: bool = True) -> None:
+        """`touch=False` for what every machine works out for itself (an expiry)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE publications SET unpublished_at=?, updated_at=? WHERE id=?",
+                (at, at, pub_id),
+            )
+            if touch:
+                r = self._conn.execute(
+                    "SELECT session_id FROM publications WHERE id=?", (pub_id,)
+                ).fetchone()
+                if r is not None:
+                    self._touch(r["session_id"])
+
+    def store_synced_publications(self, session_id: str, publications: list) -> None:
+        """Library sync's write of a meeting's publications (`SyncPublication`s, already merged
+        with ours): written as given, unpublished ones first so a row going dead never meets
+        the live one that replaces it (one live row per meeting). The caller's transaction
+        counts the new version. Rows we have that are not listed stay. Their `origin` is the
+        sender's view: its own sync id means that computer."""
+        ordered = sorted(publications, key=lambda p: not p.unpublished_at)
+        for p in ordered:
+            row = {
+                "id": p.id,
+                "session_id": session_id,
+                "key": base64.b64decode(p.key),
+                "token": p.token,
+                "place": p.where,
+                "host_url": p.host_url,
+                "version": p.version,
+                "selection": p.selection.model_dump(mode="json"),
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+                "expires_at": p.expires_at,
+                "unpublished_at": p.unpublished_at,
+                "clip_blobs": p.clip_blobs,
+                "published_digest": p.published_digest,
+                "published_by": p.published_by,
+                "origin": "" if p.origin == self.device_id else p.origin,
+            }
+            self._conn.execute(self._PUB_UPSERT, self._publication_values(row))
+
     # ---- live shared notes (services/shared_notes.py; no access checks: the caller checks) --
 
     def notes_doc(self, session_id: str) -> dict | None:
@@ -1744,12 +2240,17 @@ class SessionRepository:
         return None if row is None else dict(row)
 
     def notes_source(self, session_id: str) -> tuple[str, str] | None:
-        """(Session.notes, origin) without loading the meeting, or None for an unknown one."""
+        """(Session.notes, where the meeting is from) without loading the meeting, or None for an
+        unknown one. The second is its `origin`, or for a meeting shared with us the sharer's key
+        (`shared_from`): either way not here, so its notes document comes from there and is never
+        seeded here (services/shared_notes.py `seed_blocking`, `needs_doc_from_sync`)."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT notes, origin FROM sessions WHERE id=?", (session_id,)
+                "SELECT notes, origin, shared_from FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
-        return None if row is None else (row["notes"] or "", row["origin"] or "")
+        if row is None:
+            return None
+        return (row["notes"] or "", row["origin"] or row["shared_from"] or "")
 
     def has_notes_doc(self, session_id: str) -> bool:
         """A document exists: a stored snapshot or any frame."""
@@ -1964,6 +2465,53 @@ class SessionRepository:
             ).fetchone()
         return None if row is None else (row["notes"] or "")
 
+    def notes_op_authors(self, session_id: str, seqs: list[int]) -> list[str]:
+        """The author (name) of each of these frames of the notes log, in the order given; ""
+        for one that is not there."""
+        if not seqs:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, author FROM shared_notes_ops"
+                " WHERE session_id=? AND seq BETWEEN ? AND ?",
+                (session_id, min(seqs), max(seqs)),
+            ).fetchall()
+        by_seq = {r["seq"]: r["author"] or "" for r in rows}
+        return [by_seq.get(s, "") for s in seqs]
+
+    # ---- action items from the notes (services/notes_items.py; internal, no access checks) --
+
+    def notes_items(self, session_id: str) -> list[NotesItem] | None:
+        """The meeting's stored notes items, None for an unknown meeting."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT notes_items FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        return None if row is None else _notes_items(row["notes_items"])
+
+    def set_notes_items(self, session_id: str, items: list[NotesItem]) -> bool:
+        """Store the derived notes items. No new version (`_touch`): the notes write beside a
+        derivation counts it. False for an unknown meeting."""
+        raw = json.dumps([i.model_dump(mode="json") for i in items])
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE sessions SET notes_items=? WHERE id=?", (raw, session_id)
+            )
+        return cur.rowcount > 0
+
+    def part_offsets(self, session_id: str) -> dict[int, float]:
+        """part -> where it starts on the meeting's timeline (seconds), from its recordings, as
+        services/parts.py `offsets` gives it ({0: 0.0} without any)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT part, part_offset FROM recordings WHERE session_id=? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+        out: dict[int, float] = {}
+        for r in rows:
+            out.setdefault(r["part"], r["part_offset"])
+        return out or {0: 0.0}
+
     def events(self, session_id: str) -> list[dict]:
         if not self._readable(session_id):
             return []
@@ -2019,12 +2567,25 @@ class SessionRepository:
         self._check_write(session_id)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT name FROM sessions WHERE id=?", (session_id,)
+                "SELECT name, shared_from FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
+            # The cascade removes the meeting's peer_shares: keep who had one, so the contact
+            # still hears the meeting is gone (`shared_tombstones_since`).
+            self._conn.execute(
+                "INSERT OR REPLACE INTO peer_share_tombstones(session_id, person, at)"
+                " SELECT session_id, person, ? FROM peer_shares WHERE session_id=?",
+                (datetime.now().isoformat(), session_id),
+            )
             cur = self._conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             if cur.rowcount:
                 self._conn.execute("DELETE FROM sync_served WHERE session_id=?", (session_id,))
-                if tombstone and row is not None:
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (f"{PUSHED_SEQ_PREFIX}{session_id}", f"{REFUSED_NOTES_PREFIX}{session_id}"),
+                )
+                # A meeting shared with us is the owner's to delete: it leaves no tombstone, or
+                # our other computers would delete their copy and we could not pull it again.
+                if tombstone and row is not None and not row["shared_from"]:
                     self._conn.execute(
                         "INSERT OR REPLACE INTO sync_tombstones(session_id, at, device, name)"
                         " VALUES (?,?,?,?)",
@@ -2139,8 +2700,11 @@ class SessionRepository:
             out.append(v)
         return out
 
-    def add_seal(self, session_id: str, reason: str, content: str, audio: dict) -> dict | None:
-        """Chain a new seal to the meeting's last one; None when nothing changed since."""
+    def add_seal(
+        self, session_id: str, reason: str, content: str, audio: dict, *, force: bool = False
+    ) -> dict | None:
+        """Chain a new seal to the meeting's last one; None when nothing changed since (unless
+        `force`: a seal that records an event, services/records.py EVENT_SEALS)."""
         from .records import chain_hash
 
         at = datetime.now().isoformat()
@@ -2151,7 +2715,8 @@ class SessionRepository:
                 (session_id,),
             ).fetchone()
             if (
-                last is not None
+                not force
+                and last is not None
                 and last["content_hash"] == content
                 and json.loads(last["audio"]) == audio
             ):
@@ -2385,27 +2950,67 @@ class SessionRepository:
         return self._write_item_by_id(session_id, item_id, fields)
 
     def _write_item_by_id(self, session_id: str, item_id: str, fields: dict) -> bool:
+        """The summary's action item with this id, else the notes item with it (C14 of
+        docs/plans/2026-10-25-phase-11-tasks.md: summary ids are 8 hex, notes ids 16)."""
         if not item_id:
             return False
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT summary_data FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
-            if row is None or not row["summary_data"]:
+            if row is None:
                 return False
-            data = SummaryData.model_validate_json(row["summary_data"])
-            item = next((a for a in data.action_items if a.id == item_id), None)
-            if item is None:
-                return False
-            if all(getattr(item, k) == v for k, v in fields.items()):
-                return True  # already so: no new version
-            for k, v in fields.items():
-                setattr(item, k, v)
-            self._conn.execute(
-                "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
-                (data.model_dump_json(), datetime.now().isoformat(), session_id),
-            )
-            self._touch(session_id)
+            if row["summary_data"]:
+                data = SummaryData.model_validate_json(row["summary_data"])
+                item = next((a for a in data.action_items if a.id == item_id), None)
+                if item is not None:
+                    if all(getattr(item, k) == v for k, v in fields.items()):
+                        return True  # already so: no new version
+                    for k, v in fields.items():
+                        setattr(item, k, v)
+                    self._conn.execute(
+                        "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
+                        (data.model_dump_json(), datetime.now().isoformat(), session_id),
+                    )
+                    self._touch(session_id)
+                    return True
+            return self._write_notes_item_locked(session_id, item_id, fields)
+
+    _NOTES_ITEM_FIELDS = frozenset({"done", "follow", "due", "task_id", "issue_url"})
+
+    def set_notes_item_fields(self, session_id: str, item_id: str, **fields) -> bool:
+        """INTERNAL, for services/notes_items.py `write_fields` (which holds the meeting's notes
+        lock, so a fold cannot write over it, and puts `done` into the document too): the
+        STATE of one notes item, a new version of the meeting (`_touch`, unlike the derived
+        `set_notes_items`). No access check. True when the item exists."""
+        bad = set(fields) - self._NOTES_ITEM_FIELDS
+        if bad:
+            raise ValueError(f"Cannot set notes item fields: {sorted(bad)}")
+        if not item_id:
+            return False
+        with self._lock, self._conn:
+            return self._write_notes_item_locked(session_id, item_id, fields)
+
+    def _write_notes_item_locked(self, session_id: str, item_id: str, fields: dict) -> bool:
+        row = self._conn.execute(
+            "SELECT notes_items FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        items = _notes_items(row["notes_items"])
+        item = next((a for a in items if a.id == item_id), None)
+        if item is None:
+            return False
+        if all(getattr(item, k) == v for k, v in fields.items()):
+            return True  # already so: no new version
+        for k, v in fields.items():
+            setattr(item, k, v)
+        raw = json.dumps([i.model_dump(mode="json") for i in items])
+        self._conn.execute(
+            "UPDATE sessions SET notes_items=?, updated_at=? WHERE id=?",
+            (raw, datetime.now().isoformat(), session_id),
+        )
+        self._touch(session_id)
         return True
 
     def set_decision_links(self, session_id: str, changes: dict[str, str]) -> bool:
@@ -2495,6 +3100,277 @@ class SessionRepository:
                 [(session_id, u, by, now) for u in added],
             )
         return added, removed
+
+    # ---- sharing with contacts (phase 8; services/shares.py) -----------------------------
+    # No access checks here: the caller (a route, the hub) has applied the rules.
+
+    @staticmethod
+    def _peer_share(row) -> dict:
+        d = dict(row)
+        d["parts"] = json.loads(d["parts"] or "{}")
+        return d
+
+    def peer_shares(self, session_id: str, include_revoked: bool = False) -> list[dict]:
+        """Who a meeting is shared with (contacts' person keys), oldest first; revoked rows
+        only when asked for."""
+        sql = "SELECT * FROM peer_shares WHERE session_id=?"
+        if not include_revoked:
+            sql += " AND revoked_at=''"
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY at, person", (session_id,)).fetchall()
+        return [self._peer_share(r) for r in rows]
+
+    def peer_share(self, session_id: str, person: str) -> dict | None:
+        """The share row for one contact, revoked or not; None when there never was one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM peer_shares WHERE session_id=? AND person=?", (session_id, person)
+            ).fetchone()
+        return self._peer_share(row) if row else None
+
+    def put_peer_share(self, session_id: str, person: str, parts: dict, by: str) -> dict:
+        """Share (or change what is shared of) a meeting with a contact. Clears a revocation.
+        The meeting moves in the change feed and its version vector (`_touch`, without moving
+        `updated_at`), so the change reaches library sync and the contact's next pull.
+        Raises KeyError for an unknown meeting."""
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            if (
+                self._conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+                is None
+            ):
+                raise KeyError(session_id)
+            # `at` is when it was first shared; sharing again after a revocation starts anew.
+            self._conn.execute(
+                "INSERT INTO peer_shares (session_id, person, parts, by, at, updated_at)"
+                " VALUES (?,?,?,?,?,?) ON CONFLICT(session_id, person) DO UPDATE SET"
+                " parts=excluded.parts, by=excluded.by, updated_at=excluded.updated_at,"
+                " at=CASE WHEN revoked_at != '' THEN excluded.at ELSE at END, revoked_at=''",
+                (session_id, person, json.dumps(parts, sort_keys=True), by, now, now),
+            )
+            self._touch(session_id, keep_updated=True)
+        return self.peer_share(session_id, person) or {}
+
+    def revoke_peer_share(self, session_id: str, person: str) -> bool:
+        """Stop sharing a meeting with a contact (the row stays, marked revoked); False when
+        there was no live share."""
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE peer_shares SET revoked_at=?, updated_at=?"
+                " WHERE session_id=? AND person=? AND revoked_at=''",
+                (now, now, session_id, person),
+            )
+            if cur.rowcount:
+                self._touch(session_id, keep_updated=True)
+        return cur.rowcount > 0
+
+    def shares_for_person(self, person: str) -> list[dict]:
+        """The live shares a contact has, newest first (each with its `session_id`)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM peer_shares WHERE person=? AND revoked_at='' ORDER BY at DESC",
+                (person,),
+            ).fetchall()
+        return [self._peer_share(r) for r in rows]
+
+    def shared_changes_since(
+        self, person: str, since_seq: int, limit: int = 200
+    ) -> tuple[list[tuple[str, int]], int, bool]:
+        """The meetings live-shared with `person` that changed after `since_seq`, oldest change
+        first: ([(id, sync_seq)], the seq to ask from next time, whether there are more)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.sync_seq FROM sessions s JOIN peer_shares p ON p.session_id = s.id"
+                " WHERE p.person=? AND p.revoked_at='' AND s.shared_from='' AND s.sync_seq > ?"
+                " ORDER BY s.sync_seq LIMIT ?",
+                (person, since_seq, limit + 1),
+            ).fetchall()
+        more = len(rows) > limit
+        changes = [(r["id"], r["sync_seq"]) for r in rows[:limit]]
+        return changes, (changes[-1][1] if changes else since_seq), more
+
+    def shared_tombstones_since(self, person: str, since_at: str = "") -> list[dict]:
+        """What `person` must forget after the ISO time `since_at` ("" = ever), oldest first:
+        [{session_id, at, reason}] with reason "unshared" (the share was revoked) or "deleted"
+        (the meeting was deleted)."""
+        with self._lock:
+            unshared = self._conn.execute(
+                "SELECT session_id, revoked_at AS at FROM peer_shares"
+                " WHERE person=? AND revoked_at != '' AND revoked_at > ?",
+                (person, since_at),
+            ).fetchall()
+            deleted = self._conn.execute(
+                "SELECT session_id, at FROM peer_share_tombstones WHERE person=? AND at > ?",
+                (person, since_at),
+            ).fetchall()
+        out = [
+            {"session_id": r["session_id"], "at": r["at"], "reason": "unshared"} for r in unshared
+        ]
+        out += [
+            {"session_id": r["session_id"], "at": r["at"], "reason": "deleted"} for r in deleted
+        ]
+        return sorted(out, key=lambda t: (t["at"], t["session_id"]))
+
+    def add_signature(self, subject: str, signer: str, sig: str) -> bool:
+        """Remember who signed `subject`; True when it is new, False when `subject` was already
+        signed (the first signature stands: a record arriving twice is stored once)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO signatures (subject, signer, sig, at) VALUES (?,?,?,?)",
+                (subject, signer, sig, datetime.now().isoformat()),
+            )
+        return cur.rowcount > 0
+
+    def has_signature(self, subject: str) -> bool:
+        with self._lock:
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM signatures WHERE subject=?", (subject,)
+                ).fetchone()
+                is not None
+            )
+
+    def signature_of(self, subject: str) -> dict | None:
+        """The kept signature of `subject` ({subject, signer, sig, at}), or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT subject, signer, sig, at FROM signatures WHERE subject=?", (subject,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    # ---- meetings shared WITH this person (services/share_pull.py) -------------------------
+    # The owner's computer is the truth: a SharedMeeting replaces the copy whole. No `_touch`:
+    # these rows never enter the change feed (changes_since skips shared_from rows anyway) and
+    # never travel in library sync; each of this person's computers pulls them itself.
+
+    def shared_meeting(self, session_id: str) -> dict | None:
+        """{session_id, person, parts (dict), digest, shared_with (list), received_at} of a
+        meeting shared with us, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM shared_meetings WHERE session_id=?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["parts"] = json.loads(d["parts"] or "{}")
+        d["shared_with"] = json.loads(d["shared_with"] or "[]")
+        return d
+
+    def shared_from_ids(self, person: str) -> list[str]:
+        """The meetings `person` shares with us that we hold a copy of."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM sessions WHERE shared_from=? ORDER BY created_at", (person,)
+            ).fetchall()
+        return [r["id"] for r in rows]
+
+    def apply_shared(self, sm: SharedMeeting, person: str) -> str:
+        """Write a meeting `person` shares with us (a verified SharedMeeting) as its copy here,
+        one transaction, no access checks (the caller verified the signature). Returns "new"
+        (first arrival), "parts" (the chosen parts changed), "updated" (anything else) or
+        "clash" (a meeting of our own, or someone else's copy, has this id: nothing written).
+
+        The sessions row gets the meeting's name, times, summary, attendees, participants and
+        notes, status completed, no audio, no owner or origin, `shared_from` = person; the
+        transcript, comments and (when notes are not shared) the notes document are replaced
+        whole: what is not in `sm` is not shared any more. Search indexes follow by triggers."""
+        sid = sm.id
+        parts = sm.parts.model_dump()
+        now = datetime.now().isoformat()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT shared_from FROM sessions WHERE id=?", (sid,)
+            ).fetchone()
+            if row is not None and row["shared_from"] != person:
+                return "clash"
+            held = self._conn.execute(
+                "SELECT parts FROM shared_meetings WHERE session_id=?", (sid,)
+            ).fetchone()
+            common = (
+                sm.name,
+                _local_naive(sm.created_at).isoformat(),
+                _local_naive(sm.updated_at).isoformat(),
+                sm.summary,
+                sm.summary_data.model_dump_json() if sm.summary_data else None,
+                sm.notes,
+                json.dumps(sm.participants),
+                json.dumps(sm.attendees),
+            )
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO sessions(name, created_at, updated_at, summary, summary_data,"
+                    " notes, participants, attendees, id, status, audio_file, owner_id, origin,"
+                    " shared_from) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,'','',?)",
+                    (*common, sid, SessionStatus.COMPLETED.value, person),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE sessions SET name=?, created_at=?, updated_at=?, summary=?,"
+                    " summary_data=?, notes=?, participants=?, attendees=?, status=?,"
+                    " audio_file=NULL, owner_id='', origin='' WHERE id=?",
+                    (*common, SessionStatus.COMPLETED.value, sid),
+                )
+            self._write_segments(
+                sid,
+                [
+                    TranscriptSegment(text=t.text, speaker=t.speaker, start=t.start, end=t.end)
+                    for t in sm.transcript
+                ],
+            )
+            self._conn.execute("DELETE FROM comments WHERE session_id=?", (sid,))
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO comments (id, session_id, parent_id, target, target_id,"
+                " anchor, quote, text, author_id, author, mentions, created_at, updated_at,"
+                " resolved_at, resolved_by, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        c.id,
+                        sid,
+                        c.parent_id,
+                        c.target,
+                        c.target_id,
+                        json.dumps(c.anchor),
+                        c.quote,
+                        c.text,
+                        c.author_id,
+                        c.author,
+                        json.dumps(c.mentions),
+                        c.created_at,
+                        c.updated_at,
+                        c.resolved_at,
+                        c.resolved_by,
+                        int(c.deleted),
+                    )
+                    for c in sm.comments
+                ],
+            )
+            if not sm.parts.notes:
+                self._conn.execute("DELETE FROM shared_notes_ops WHERE session_id=?", (sid,))
+                self._conn.execute("DELETE FROM shared_notes WHERE session_id=?", (sid,))
+                # The log starts over: what was sent of it counts for nothing now.
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key IN (?, ?)",
+                    (f"{PUSHED_SEQ_PREFIX}{sid}", f"{REFUSED_NOTES_PREFIX}{sid}"),
+                )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO shared_meetings (session_id, person, parts, digest,"
+                " shared_with, received_at) VALUES (?,?,?,?,?,?)",
+                (
+                    sid,
+                    person,
+                    json.dumps(parts, sort_keys=True),
+                    sm.digest,
+                    json.dumps(sm.shared_with),
+                    now,
+                ),
+            )
+        if row is None:
+            return "new"
+        if held is None or json.loads(held["parts"] or "{}") != parts:
+            return "parts"
+        return "updated"
 
     # ---- organizations (services/organizations.py) ---------------------------
 
@@ -2804,28 +3680,40 @@ class SessionRepository:
     # ---- action items ----------------------------------------------------
 
     def list_action_items(self):
-        """Every action item of every summarized session, newest meeting first."""
+        """Every action item of every summarized session, newest meeting first: the summary's
+        (idx = position, source "summary"), then those typed in the notes (idx = -(j+1),
+        source "notes"; services/notes_items.py), also of meetings without a summary."""
         from ..services.tasks import TaskItem
 
         visible = self.visible_ids()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, name, created_at, summary_data, owner_id FROM sessions"
-                " WHERE summary_data IS NOT NULL ORDER BY created_at DESC"
+                "SELECT id, name, created_at, summary_data, notes_items, owner_id FROM sessions"
+                " WHERE summary_data IS NOT NULL OR notes_items NOT IN ('', '[]')"
+                " ORDER BY created_at DESC"
             ).fetchall()
         out = []
         for r in rows:
             if visible is not None and r["id"] not in visible:
                 continue
-            data = SummaryData.model_validate_json(r["summary_data"])
+            data = (
+                SummaryData.model_validate_json(r["summary_data"])
+                if r["summary_data"]
+                else SummaryData()
+            )
             writable = access.can_write(r["owner_id"])
-            for i, a in enumerate(data.action_items):
+            entries = [(i, a, "summary") for i, a in enumerate(data.action_items)] + [
+                (-(j + 1), a, "notes") for j, a in enumerate(_notes_items(r["notes_items"]))
+            ]
+            for i, a, source in entries:
                 out.append(
                     TaskItem(
                         session_id=r["id"],
                         session_name=r["name"],
                         created_at=_dt(r["created_at"]),
                         idx=i,
+                        item_id=a.id,
+                        source=source,
                         text=a.text,
                         owner=a.owner,
                         done=a.done,
@@ -2838,14 +3726,18 @@ class SessionRepository:
         return out
 
     def action_item_sources(self) -> list[dict]:
-        """Every summarized meeting, newest first, as {id, name, created_at, owner_id,
-        attendees, summary_data (SummaryData)}, NOT filtered by access: for
-        services/task_links.py, which needs every mention of a task and filters by
-        `visible_ids()` itself. Same cost as `list_action_items`."""
+        """Every meeting with action items (summarized, or with items typed in its notes),
+        newest first, as {id, name, created_at, owner_id, attendees, shared_from, summary_data
+        (SummaryData, an empty one for a meeting without a summary), notes_items
+        (list[NotesItem])}, NOT filtered by access: for services/task_links.py, which needs
+        every mention of a task and filters by `visible_ids()` itself. Same cost as
+        `list_action_items`."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, name, created_at, owner_id, attendees, summary_data FROM sessions"
-                " WHERE summary_data IS NOT NULL ORDER BY created_at DESC"
+                "SELECT id, name, created_at, owner_id, attendees, summary_data, notes_items,"
+                " shared_from FROM sessions"
+                " WHERE summary_data IS NOT NULL OR notes_items NOT IN ('', '[]')"
+                " ORDER BY created_at DESC"
             ).fetchall()
         return [
             {
@@ -2854,19 +3746,26 @@ class SessionRepository:
                 "created_at": _dt(r["created_at"]),
                 "owner_id": r["owner_id"],
                 "attendees": json.loads(r["attendees"] or "[]"),
-                "summary_data": SummaryData.model_validate_json(r["summary_data"]),
+                "shared_from": r["shared_from"],
+                "summary_data": (
+                    SummaryData.model_validate_json(r["summary_data"])
+                    if r["summary_data"]
+                    else SummaryData()
+                ),
+                "notes_items": _notes_items(r["notes_items"]),
             }
             for r in rows
         ]
 
     def meeting_meta(self):
-        """Name, date, attendees and summary of every session, without transcripts."""
+        """Name, date, attendees, summary and notes items of every session, without transcripts."""
         from ..services.brief import MeetingMeta
 
         visible = self.visible_ids()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, name, created_at, attendees, summary, summary_data FROM sessions"
+                "SELECT id, name, created_at, attendees, summary, summary_data, notes_items"
+                " FROM sessions"
             ).fetchall()
         rows = [r for r in rows if visible is None or r["id"] in visible]
         return [
@@ -2881,9 +3780,132 @@ class SessionRepository:
                     if r["summary_data"]
                     else None
                 ),
+                notes_items=_notes_items(r["notes_items"]),
             )
             for r in rows
         ]
+
+    # ---- the outbox: what I did on meetings shared with me (services/share_push.py) --------
+
+    OUTBOX_KEEP = timedelta(days=30)  # accepted and rejected rows are kept this long
+
+    def outbox_add(
+        self,
+        record_id: str,
+        session_id: str,
+        person: str,
+        kind: str,
+        payload: dict,
+        created_at: str,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO share_outbox (id, session_id, person, kind, payload,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (record_id, session_id, person, kind, json.dumps(payload), created_at),
+            )
+
+    @staticmethod
+    def _outbox_row(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"] or "{}")
+        d["frame_hashes"] = json.loads(d["frame_hashes"] or "[]")
+        return d
+
+    def outbox_pending(self, person: str = "", session_id: str = "") -> list[dict]:
+        """Pending rows, first made first (then in the order they were added), of one owner
+        and/or one meeting (blank: any)."""
+        sql, args = "SELECT * FROM share_outbox WHERE status='pending'", []
+        if person:
+            sql, args = sql + " AND person=?", [*args, person]
+        if session_id:
+            sql, args = sql + " AND session_id=?", [*args, session_id]
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY created_at, rowid", args).fetchall()
+        return [self._outbox_row(r) for r in rows]
+
+    def outbox_drop_person(self, person: str) -> int:
+        """Forget everything in the outbox for one owner (a removed contact): returns the rows."""
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM share_outbox WHERE person=?", (person,))
+        return cur.rowcount
+
+    def outbox_people(self) -> list[str]:
+        """The owners something is waiting for."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT person FROM share_outbox WHERE status='pending'"
+            ).fetchall()
+        return [r["person"] for r in rows]
+
+    def outbox_counts(self, session_id: str) -> dict[str, int]:
+        """Pending rows of a meeting by kind."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM share_outbox WHERE session_id=?"
+                " AND status='pending' GROUP BY kind",
+                (session_id,),
+            ).fetchall()
+        return {r["kind"]: r["n"] for r in rows}
+
+    def outbox_mark(self, results: list[tuple[str, bool, str]]) -> None:
+        """Settle rows: (id, accepted, reason). A row not pending any more is left as it is."""
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._conn:
+            for record_id, ok, reason in results:
+                self._conn.execute(
+                    "UPDATE share_outbox SET status=?, reason=?, pushed_at=?"
+                    " WHERE id=? AND status='pending'",
+                    ("accepted" if ok else "rejected", "" if ok else reason, now, record_id),
+                )
+            old = (datetime.now(UTC) - self.OUTBOX_KEEP).isoformat()
+            self._conn.execute(
+                "DELETE FROM share_outbox WHERE status!='pending' AND pushed_at!=''"
+                " AND pushed_at<?",
+                (old,),
+            )
+
+    def outbox_rejected(self, session_id: str, limit: int = 20) -> list[dict]:
+        """The rows the owner refused, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM share_outbox WHERE session_id=? AND status='rejected'"
+                " ORDER BY pushed_at DESC, rowid DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [self._outbox_row(r) for r in rows]
+
+    def notes_ops_after(
+        self, session_id: str, after_seq: int, author_id: str
+    ) -> list[tuple[int, bytes]]:
+        """(seq, frame) of the frames `author_id` typed here after `after_seq`, in log order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, frame FROM shared_notes_ops WHERE session_id=? AND seq>?"
+                " AND author_id=? ORDER BY seq",
+                (session_id, after_seq, author_id),
+            ).fetchall()
+        return [(r["seq"], bytes(r["frame"])) for r in rows]
+
+    def pushed_seq(self, session_id: str) -> int:
+        """The last of my notes frames the owner accepted (0: none)."""
+        value = self.get_meta(f"{PUSHED_SEQ_PREFIX}{session_id}")
+        try:
+            return int(value) if value else 0
+        except ValueError:
+            return 0
+
+    def set_pushed_seq(self, session_id: str, seq: int) -> None:
+        if self._shared_from(session_id):  # a meeting deleted meanwhile leaves no key behind
+            self.set_meta(f"{PUSHED_SEQ_PREFIX}{session_id}", str(seq))
+
+    def notes_rejection(self, session_id: str) -> str:
+        """Why the owner refused my typed notes last ('' = not refused)."""
+        return self.get_meta(f"{REFUSED_NOTES_PREFIX}{session_id}") or ""
+
+    def set_notes_rejection(self, session_id: str, reason: str) -> None:
+        if reason or self.get_meta(f"{REFUSED_NOTES_PREFIX}{session_id}"):
+            self.set_meta(f"{REFUSED_NOTES_PREFIX}{session_id}", reason)
 
     # ---- semantic index ------------------------------------------------
 
@@ -3289,12 +4311,14 @@ class SessionRepository:
 
     # ---- library sync (services/sync) ----------------------------------
 
-    def _touch(self, session_id: str, at: str | None = None) -> None:
+    def _touch(self, session_id: str, at: str | None = None, *, keep_updated: bool = False) -> None:
         """A meeting got a new version: move it to the head of the change log (`sync_seq`
         from the global counter in meta), count one more revision for this machine in its
         version vector (under `device_id`, "" until the sync service names this machine) and
         set `updated_at`. Called inside the writer's own transaction, so a failed write leaves
-        no trace. A meeting that does not exist is left alone."""
+        no trace. A meeting that does not exist is left alone. `keep_updated`: leave `updated_at`
+        alone (a change to who the meeting is shared with is not a change to the meeting: it
+        must not move the sidebar order, a digest window or "publication behind")."""
         row = self._conn.execute(
             "SELECT sync_vv FROM sessions WHERE id=?", (session_id,)
         ).fetchone()
@@ -3307,6 +4331,12 @@ class SessionRepository:
         )
         vv = json.loads(row["sync_vv"] or "{}")
         vv[self.device_id] = vv.get(self.device_id, 0) + 1
+        if keep_updated:
+            self._conn.execute(
+                "UPDATE sessions SET sync_seq=?, sync_vv=? WHERE id=?",
+                (seq, json.dumps(vv, sort_keys=True), session_id),
+            )
+            return
         self._conn.execute(
             "UPDATE sessions SET sync_seq=?, sync_vv=?, updated_at=? WHERE id=?",
             (seq, json.dumps(vv, sort_keys=True), at or datetime.now().isoformat(), session_id),
@@ -3325,7 +4355,7 @@ class SessionRepository:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, sync_seq, sync_vv FROM sessions WHERE sync_seq > ?"
-                " ORDER BY sync_seq LIMIT ?",
+                " AND shared_from = '' ORDER BY sync_seq LIMIT ?",
                 (seq, limit + 1),
             ).fetchall()
         more = len(rows) > limit
@@ -3400,6 +4430,16 @@ class SessionRepository:
                 (session_id, peer_id, session_id, peer_id, self.SERVED_KEPT),
             )
 
+    def rename_sync_peer(self, old: str, new: str, cursor_key: str) -> None:
+        """A sync peer's id changed: its served states and tombstone cursor follow."""
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM sync_served WHERE peer_id=?", (new,))
+            self._conn.execute("UPDATE sync_served SET peer_id=? WHERE peer_id=?", (new, old))
+            self._conn.execute("DELETE FROM meta WHERE key=?", (cursor_key + new,))
+            self._conn.execute(
+                "UPDATE meta SET key=? WHERE key=?", (cursor_key + new, cursor_key + old)
+            )
+
     def served_snapshot(self, session_id: str, peer_id: str, rev: int) -> str | None:
         with self._lock:
             row = self._conn.execute(
@@ -3412,8 +4452,8 @@ class SessionRepository:
         """Everything of a meeting that library sync reads, as raw rows from one consistent
         snapshot, without access checks (the sync service is the machine itself, not a
         request): None when there is no such meeting. Keys: session, segments, recordings,
-        bookmarks, live_flags, external_notes, comments (`comment_rows`),
-        embeddings, assets (with `linked_at`), events (with `uid`, oldest first)."""
+        bookmarks, live_flags, external_notes, comments (`comment_rows`), publications,
+        peer_shares, embeddings, assets (with `linked_at`), events (with `uid`, oldest first)."""
 
         def rows(sql: str) -> list[dict]:
             return [dict(r) for r in self._conn.execute(sql, (session_id,)).fetchall()]
@@ -3436,6 +4476,15 @@ class SessionRepository:
                     "SELECT * FROM external_notes WHERE session_id=? ORDER BY added_at, id"
                 ),
                 "comments": self.comment_rows(session_id),
+                "publications": [
+                    dict(r)
+                    for r in self._conn.execute(
+                        f"SELECT {self._PUB_COLS} FROM publications WHERE session_id=?"
+                        " ORDER BY created_at, id",
+                        (session_id,),
+                    ).fetchall()
+                ],
+                "peer_shares": rows("SELECT * FROM peer_shares WHERE session_id=? ORDER BY person"),
                 "embeddings": rows("SELECT * FROM session_speakers WHERE session_id=?"),
                 "assets": rows(
                     "SELECT a.*, sa.added_at AS linked_at FROM assets a"
@@ -3577,6 +4626,8 @@ class SessionRepository:
                 [(sid, label, json.dumps(vec)) for label, vec in s.speaker_embeddings.items()],
             )
             self._link_synced_assets(sid, s)
+            self.store_synced_publications(sid, s.publications)
+            self._store_synced_peer_shares(sid, s.peer_shares)
             have = {
                 r["uid"]
                 for r in self._conn.execute(
@@ -3597,6 +4648,36 @@ class SessionRepository:
             else:
                 self._advance_seq(sid)
         return sid
+
+    def _store_synced_peer_shares(self, session_id: str, shares: list[SyncPeerShare]) -> None:
+        """Library sync's write of a meeting's shares: by person, the later row wins (as in
+        `merge_peer_shares`), and none is ever removed, so an older peer that does not send the
+        field wipes nothing. Inside the caller's transaction."""
+        for p in shares:
+            have = self._conn.execute(
+                "SELECT * FROM peer_shares WHERE session_id=? AND person=?",
+                (session_id, p.person),
+            ).fetchone()
+            if have is not None:
+                mine = SyncPeerShare(
+                    **{k: have[k] for k in SyncPeerShare.model_fields if k != "parts"},
+                    parts=json.loads(have["parts"] or "{}"),
+                )
+                if peer_share_rank(p) <= peer_share_rank(mine):
+                    continue
+            self._conn.execute(
+                "INSERT OR REPLACE INTO peer_shares (session_id, person, parts, by, at,"
+                " updated_at, revoked_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    session_id,
+                    p.person,
+                    json.dumps(p.parts, sort_keys=True),
+                    p.by,
+                    p.at,
+                    p.updated_at,
+                    p.revoked_at,
+                ),
+            )
 
     def _link_synced_assets(self, session_id: str, s: SyncSession) -> None:
         """The meeting's asset links become the incoming ones. A link asset is found by its

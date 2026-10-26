@@ -29,11 +29,11 @@ from ...audio.streams import CaptureApp
 from ...models.base import ApiModel
 from ...models.session import DEFAULT_SESSION_NAME, Recording, Session, SessionStatus
 from ...models.transcript import TranscriptSegment
-from ...services import history
+from ...services import guest_notes, history
 from ...services.copilot import copilot_runner
 from ...services.encryption import seal_session_audio
 from ...services.origin import audio_elsewhere, is_foreign, origin_name, require_local_audio
-from ...services.parts import add_part, next_part
+from ...services.parts import add_part, next_part, part_start, recording_clock
 from ...services.pipeline import live_transcribe, transcribe_session
 from ...services.recovery import write_manifest
 from ...storage.crypto import EncryptedFile, is_encrypted
@@ -73,11 +73,21 @@ def _devices() -> dict:
     return {d.id: d for d in list_devices()}
 
 
+class PartClock(ApiModel):
+    """Where a recording in progress is on its meeting's timeline (services/parts.py
+    `recording_clock`): time chips in the notes are (part, seconds since `started_at`)."""
+
+    part: int  # the part it records into (a capture restart is a new part)
+    offset: float  # where that part starts on the meeting's joined timeline (seconds)
+    started_at: str  # when capture of this part started (UTC ISO)
+
+
 class StartRecordingResponse(ApiModel):
     session_id: str
     recording_id: str
     live_job_id: str | None = None
     message: str
+    clock: PartClock | None = None
 
 
 class StopRecordingRequest(ApiModel):
@@ -319,6 +329,8 @@ async def begin_recording(
 
     taken = pending_parts(ctx.settings.recordings_dir / session.id, session)
     recording.part = max(next_part(session), max(taken, default=-1) + 1)
+    # The part clock (time chips, guests' META): where this part will start on the timeline.
+    recording.clock_start = await part_start(ctx, session, recording.part)
     try:
         devices = {} if is_browser(recording) else await asyncio.to_thread(_devices)
     except Exception:
@@ -342,6 +354,7 @@ async def begin_recording(
         devices=[recording.labels.get(p.device_id, str(p.device_id)) for p in recording.processes],
         restart=keep_notes,
     )
+    guest_notes.recording_started(ctx, session.id)  # a pending automatic end of a live room is off
     ctx.level_tasks[session.id] = asyncio.create_task(_stream_levels(ctx, session.id, recording))
 
     live_job_id = None
@@ -359,6 +372,7 @@ async def begin_recording(
         recording_id=recording.session_id,
         live_job_id=live_job_id,
         message=f"Recording started from {len(recording.processes)} device(s)",
+        clock=recording_clock(ctx, session.id),
     )
 
 
@@ -401,6 +415,7 @@ async def stop_active(
         reason=reason,
         seconds=round(time.time() - recording.started_at, 1),
     )
+    guest_notes.recording_stopped(ctx, session_id)  # a live guest room ends some hours later
     task = ctx.level_tasks.pop(session_id, None)
     if task is not None:
         task.cancel()
@@ -553,6 +568,7 @@ class ActiveRecording(ApiModel):
     live: bool  # live transcription is running
     live_segments: list[LiveSegment] = []  # the live transcript so far
     problems: dict[str, str] = {}  # device id -> "stopped" | "stalled" (audio/health.py)
+    clock: PartClock | None = None
 
 
 @router.get("/active", response_model=list[ActiveRecording])
@@ -579,6 +595,7 @@ async def active(ctx: AppContext = Depends(get_ctx)):
                 live=live is not None,
                 live_segments=segments,
                 problems={str(d): state for d, state in recording.problems.items()},
+                clock=recording_clock(ctx, session_id),
             )
         )
     return out

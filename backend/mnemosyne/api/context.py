@@ -21,7 +21,7 @@ from ..jobs import JobManager
 from ..search.index import VectorIndex
 from ..services.awake import KeepAwake
 from ..services.calendar_service import CalendarService, calendar_source
-from ..services.link import LinkService
+from ..services.link import LinkService, RoomsLink, parse_relays
 from ..services.meeting_types import available_types
 from ..services.model_service import ModelService
 from ..services.pairing import PairingService
@@ -53,6 +53,7 @@ class AppContext:
     pairing: PairingService
     users: UserService
     link: LinkService
+    rooms_link: RoomsLink
     sync_peers: SyncPeerStore
     active_recordings: dict[str, RecordingSession] = field(default_factory=dict)
     startup_problems: list[str] = field(default_factory=list)  # shown by the app
@@ -78,6 +79,8 @@ class AppContext:
     copilot_notes: dict = field(default_factory=dict)  # session id -> CopilotNotes
     # Live shared notes (services/shared_notes.py): the open meetings' rooms and fold locks.
     notes_hub: Any = None
+    # Guest notes (services/guest_notes.py): the bridges of live rooms and a lock per meeting.
+    guest_bridges: Any = None
     # A team server's per-person calendars (calendar_for), by ICS link.
     person_calendars: dict = field(default_factory=dict)
     team_host: TeamHost = field(default_factory=lambda: TeamHost())
@@ -93,12 +96,40 @@ class AppContext:
     http_transport: object | None = None  # tests inject an httpx transport for integrations
     app_watch: Any = None  # api/app_watch.py: the desktop app this backend belongs to
     sync: Any = None  # services/sync_service.py SyncService: library sync with the peers
+    share_announce: Any = (
+        None  # services/share_announce.py: pokes contacts a shared meeting changed
+    )
+    share_pull: Any = None  # services/share_pull.py SharePuller: meetings contacts share with us
+    share_push: Any = None  # services/share_push.py SharePusher: what I did on them, sent back
+    person: Any = None  # services/person.py PersonKeys: this person's signing key
 
     def __post_init__(self) -> None:
         self.summarizer.name_source = self.known_names
         self.sessions.type_source = lambda: available_types(self.settings)
         self.sessions.is_recording = lambda sid: sid in self.active_recordings
         self.repo.on_new_session = self._new_session
+        self.sessions.before_delete = self._forget_publications
+
+    def _forget_publications(self, session_id: str):
+        from ..services import guest_notes
+        from ..services.publishing import forget_session
+
+        afters = [
+            after
+            for after in (
+                forget_session(self, session_id),
+                guest_notes.forget_session(self, session_id),
+            )
+            if after is not None
+        ]
+        if not afters:
+            return None
+
+        def after() -> None:
+            for step in afters:
+                step()
+
+        return after
 
     def calendar_for(self, user_id: str) -> CalendarService:
         """Whose calendar: on a team server, a person's own ICS feed (services/prefs.py),
@@ -186,6 +217,7 @@ class AppContext:
             pairing=PairingService(settings.data_dir / "paired_devices.json"),
             users=UserService(settings.data_dir / "users.json"),
             link=LinkService(settings.data_dir, int(os.environ.get("MNEMOSYNE_BIND_PORT", "8008"))),
+            rooms_link=_rooms_link(settings),
             sync_peers=SyncPeerStore(settings.data_dir / "sync_peers.json"),
             jobs=JobManager(
                 bus,
@@ -199,14 +231,38 @@ class AppContext:
                 },
             ),
         )
+        from ..services.person import PersonKeys
+
+        ctx.person = PersonKeys(
+            settings.data_dir, lambda: ctx.master_key, lambda: ctx.settings.encrypt_at_rest
+        )
+        if not locked:  # while locked, unlock loads it
+            try:
+                ctx.person.ensure()
+            except Exception:
+                logger.warning("Could not load the person key", exc_info=True)
         from ..services.sync_service import SyncService
 
         ctx.sync = SyncService(ctx)  # also names this machine in version vectors
+        from ..services.share_announce import ShareAnnouncer
 
-        # The sidecar's listeners are new each start: dial the sync peers again, then pull.
+        ctx.share_announce = ShareAnnouncer(ctx)
+        from ..services.share_pull import SharePuller
+
+        ctx.share_pull = SharePuller(ctx)
+        from ..services.share_push import SharePusher
+
+        ctx.share_push = SharePusher(ctx)
+
+        # The sidecar's listeners are new each start: dial the sync peers and the contacts'
+        # machines again, then pull.
         async def redial() -> None:
+            from ..services.contacts import dial_contacts
+
             await dial_all(ctx.link, ctx.sync_peers)
+            await dial_contacts(ctx)  # never raises
             ctx.sync.wake()
+            ctx.share_pull.wake()
 
         ctx.link.on_ready.append(redial)
         return ctx
@@ -231,6 +287,7 @@ class AppContext:
             await self.index.stop()
             self.index = VectorIndex(self.repo, settings)
             self.index.start(self.bus)
+        self.index.include_shared(settings.shared_in_search)  # a rebuilt index has it already
         if calendar_source(settings) != self.calendar.source:
             self.calendar = CalendarService(calendar_source(settings))
         await self.models.apply_settings(settings)
@@ -251,12 +308,23 @@ class AppContext:
         return self.jobs.submit("supervision_scan", run)
 
     async def apply_remote_access(self) -> None:
-        relays = [u.strip() for u in self.settings.remote_relays.split(",") if u.strip()]
+        relays = parse_relays(self.settings.remote_relays)
         if self.link.active and (not self.settings.remote_access or relays != self.link.relays):
             await self.link.stop()
         self.link.relays = relays
         if self.settings.remote_access and not self.link.active:
             self.link.start()
+
+    async def ensure_rooms(self) -> RoomsLink:
+        """Start the guest rooms sidecar if it is not running and wait for its ready line.
+        Idempotent. Raises LinkError (services/link.py) when it cannot start. A running sidecar
+        keeps the relays it started with."""
+        link = self.rooms_link
+        if not link.active or link._task.done():
+            link.relays = parse_relays(self.settings.remote_relays)
+            link.start()
+        await link.wait_ready()
+        return link
 
     def busy_sessions(self) -> set[str]:
         """Sessions whose audio must not be touched right now."""
@@ -290,6 +358,12 @@ class AppContext:
                 self.run_retention()
             except Exception:
                 logger.exception("Audio retention pass failed")
+            try:
+                from ..services.publishing import sweep_expired
+
+                sweep_expired(self)
+            except Exception:
+                logger.exception("Removing expired publications failed")
             await asyncio.sleep(interval_seconds)
 
     def maybe_schedule_digest(self, now: datetime | None = None):
@@ -447,6 +521,10 @@ class AppContext:
         apply_path_rebase(self.repo, self.settings)  # a restore from another machine
         self.keystore.set(master)
         self.master_key, self.locked = master, False
+        try:
+            self.person.ensure()
+        except Exception:
+            logger.warning("Could not load the person key", exc_info=True)
         await self._start_services()
 
     async def _start_services(self) -> None:
@@ -483,6 +561,13 @@ class AppContext:
         await self._try("Task links", self._reconcile_tasks)
         # Library sync: claim meetings from before it, then pull from the peers and watch.
         await self._try("Library sync", self.sync.start)
+        await self._try("Share announcer", self.share_announce.start)
+        await self._try("Share pull", self.share_pull.start)
+        await self._try("Share push", self.share_push.start)
+        # Live guest notes rooms: a bridge for each, joined with the last seq it applied.
+        from ..services import guest_notes
+
+        await self._try("Guest notes", lambda: guest_notes.resume(self))
 
     async def _reconcile_tasks(self) -> None:
         from ..services import task_links, task_migration
@@ -536,7 +621,14 @@ class AppContext:
                 seconds=round(time.time() - recording.started_at, 1),
             )
         await self.sync.stop()
+        if self.share_announce is not None:
+            await self.share_announce.stop()
+        if self.share_push is not None:
+            await self.share_push.stop()
+        if self.share_pull is not None:
+            await self.share_pull.stop()
         await self.link.stop()
+        await self.rooms_link.stop()
         await self.index.stop()
         for task in (
             self._retention_task,
@@ -552,8 +644,9 @@ class AppContext:
         await self.echo.stop()
         await self.jobs.shutdown()
         await self.models.unload()
-        from ..services import shared_notes
+        from ..services import guest_notes, shared_notes
 
+        await guest_notes.shutdown(self)  # before the notes hub: its bridges detach from it
         await shared_notes.shutdown(self)
         self.repo.close()
 
@@ -585,6 +678,19 @@ def _pw_dump() -> list:
 
     out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5, check=True)
     return json.loads(out.stdout)
+
+
+def _rooms_link(settings: Settings) -> RoomsLink:
+    """The guest rooms sidecar (not started): it serves the same guest page and viewer builds
+    the backend serves on /n/ and /p/."""
+    from .routes.publishing import GUEST_DIR, VIEWER_DIR  # routes import this module
+
+    return RoomsLink(settings.data_dir, GUEST_DIR, VIEWER_DIR)
+
+
+async def ensure_rooms(ctx: AppContext) -> RoomsLink:
+    """Start the guest rooms sidecar on demand (AppContext.ensure_rooms)."""
+    return await ctx.ensure_rooms()
 
 
 def get_ctx(request: Request) -> AppContext:

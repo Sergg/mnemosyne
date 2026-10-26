@@ -217,7 +217,8 @@ def test_sync_code_redeemed_on_a_records_b_and_answers_with_a_self(node, ctx, si
     assert r.status_code == 200, r.text
     body = r.json()
     me = ctx.sync_peers.self_info()
-    assert body["sync"] == {"id": me.id, "name": me.name}
+    # This redeemer sent no person key info (a computer from before it): no offer.
+    assert body["sync"] == {"id": me.id, "name": me.name, "person": None}
     assert body["device"]["kind"] == "desktop" and body["token"]
     assert ctx.pairing.verify(body["token"]).endpoint_id == THIRD
 
@@ -293,7 +294,11 @@ def test_listing_never_shows_tokens(node, ctx, sidecar):
     redeem_as_a(node, ctx, token="very-secret-token")
     peers = node.get("/api/sync/peers", headers=ADMIN)
     me = ctx.sync_peers.self_info()
-    assert peers.json()["self"] == {"id": me.id, "name": me.name}
+    assert peers.json()["self"] == {
+        "id": me.id,
+        "name": me.name,
+        "person": {"pid": ctx.person.pid, "fingerprint": ctx.person.fingerprint},
+    }
     [peer] = peers.json()["peers"]
     assert set(peer) == {"id", "name", "endpoint_id", "created_at", "last_sync_at", "listen"}
     status = node.get("/api/sync/status", headers=ADMIN)
@@ -411,3 +416,38 @@ async def test_request_times_out_and_fails_when_the_sidecar_dies(tmp_path, monke
             await link.request("dial")
     finally:
         await link.stop()
+
+
+# ---- a stated sync id cannot take over another peer's record --------------------------------
+
+
+def test_a_claimed_id_bound_to_another_endpoint_is_refused(client, ctx, node):
+    assert (
+        redeem_as_a(client, ctx, endpoint=OTHER, peer_id="laptop123456", token="tok-first")[
+            1
+        ].status_code
+        == 200
+    )
+    before = ctx.sync_peers.get("laptop123456")
+    devices = len(ctx.pairing.devices())
+    _, r = redeem_as_a(client, ctx, endpoint=THIRD, peer_id="laptop123456", token="tok-evil")
+    assert r.status_code == 409 and "already syncs" in r.json()["detail"]
+    kept = ctx.sync_peers.get("laptop123456")
+    assert (
+        (kept.endpoint_id, kept.token) == (OTHER, "tok-first") == (before.endpoint_id, before.token)
+    )
+    assert ctx.sync_peers.find_by_endpoint(THIRD) is None
+    assert len(ctx.pairing.devices()) == devices  # the redeemed device was revoked
+
+
+def test_pairing_the_same_endpoint_again_still_works(client, ctx, node):
+    redeem_as_a(client, ctx, endpoint=OTHER, peer_id="laptop123456", token="tok-1")
+    _, r = redeem_as_a(client, ctx, endpoint=OTHER, peer_id="laptop123456", token="tok-2")
+    assert r.status_code == 200
+    peer = ctx.sync_peers.get("laptop123456")
+    assert peer.token == "tok-2" and len(ctx.sync_peers.peers()) == 1
+
+
+def test_a_peer_cannot_claim_our_own_sync_id(client, ctx, node):
+    _, r = redeem_as_a(client, ctx, endpoint=OTHER, peer_id=ctx.sync_peers.self_info().id)
+    assert r.status_code == 409 and ctx.sync_peers.peers() == []

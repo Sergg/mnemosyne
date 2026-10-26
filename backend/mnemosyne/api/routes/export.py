@@ -13,7 +13,7 @@ from ...export.obsidian import ObsidianExporter
 from ...jobs import Job
 from ...models.base import ApiModel
 from ...models.session import ActionItem
-from ...services import history
+from ...services import history, shared_with_me
 from ...services.vault_sync import write_note
 from ..context import AppContext, get_ctx
 
@@ -53,18 +53,19 @@ def task_predicate(ctx: AppContext, session) -> Callable[[ActionItem], bool] | N
 
 def continued_notes(ctx: AppContext, session) -> dict[str, str]:
     """Action item id -> the note of the later meeting that mentions the same task (the head
-    of its task object, services/task_links.py), for the items of `session` that another
-    meeting continues. {} when none; never raises."""
+    of its task object, services/task_links.py), for the items of `session` (the summary's and
+    the ones typed in its notes) that another meeting continues. {} when none; never raises."""
     from ...export.obsidian import stem_of
     from ...services import task_links
 
     data = session.summary_data
-    if data is None or not any(a.task_id and a.id for a in data.action_items):
+    items = [*(data.action_items if data is not None else []), *session.notes_items]
+    if not any(a.task_id and a.id for a in items):
         return {}
     try:
         objects = task_links.index(ctx.repo, ctx.repo.visible_ids())
         out: dict[str, str] = {}
-        for item in data.action_items:
+        for item in items:
             obj = objects.get(item.task_id) if item.task_id and item.id else None
             if obj is None or not any(m.session_id == session.id for m in obj.mentions):
                 continue
@@ -82,6 +83,7 @@ def build_exporter(ctx: AppContext, vault_path: str, session=None) -> ObsidianEx
     """An exporter with the settings; a session's meeting type may choose the folder."""
     from ...export.vault_index import linkable_notes
     from ...services.meeting_types import available_types, obsidian_folder
+    from ...services.notes_chips import exported_meeting_note
     from ...services.vault_sync import vault_annex
 
     st = ctx.settings
@@ -100,6 +102,7 @@ def build_exporter(ctx: AppContext, vault_path: str, session=None) -> ObsidianEx
         known_notes=(lambda: linkable_notes(root, own)) if links else None,
         annex=vault_annex(ctx, session.id) if session is not None else None,
         continued=continued_notes(ctx, session) if session is not None else None,
+        meeting_note=lambda mid: exported_meeting_note(ctx.repo, mid),
     )
 
 
@@ -140,7 +143,9 @@ def before_export(ctx: AppContext, session, vault_path: str):
     from ...services.vault_sync import apply_vault_edits, apply_vault_ticks
 
     fold_blocking(ctx, session.id)  # live notes typed so far (a no-op when all are folded)
-    if not session.origin:  # a meeting recorded elsewhere has its note read there
+    # A meeting recorded elsewhere has its note read there; one shared with me is the owner's
+    # (its note is only written here, never read back).
+    if not session.origin and not session.shared_from:
         apply_vault_ticks(ctx, session, vault_path)
         apply_vault_edits(ctx, session, vault_path)
     # Read again in any case: taking edits may also have given the summary's items their ids.
@@ -152,8 +157,9 @@ def write_decisions(ctx: AppContext, vault_path: str):
     from ...export.topic_notes import write_decisions_log
 
     meetings = []
+    shared = ctx.settings.shared_in_obsidian
     for summary in ctx.repo.list_summaries():  # newest first, only what the caller may read
-        if not summary.has_summary:
+        if not summary.has_summary or (summary.shared_from and not shared):
             continue
         s = ctx.repo.get(summary.id)
         if s is not None and s.summary_data and s.summary_data.decisions:
@@ -207,6 +213,7 @@ def export_session(ctx: AppContext, session, vault_path: str, decisions: bool = 
                 (st.local_speaker_name, st.remote_speaker_name),
                 redact=st.redact_exports,
                 task_scope=st.obsidian_task_scope,
+                skip=shared_with_me.excluded(ctx, "shared_in_obsidian"),
             )
         except Exception:
             logger.warning("Person notes failed for session %s", session.id, exc_info=True)
@@ -257,6 +264,12 @@ async def export_to_obsidian(session_id: str, ctx: AppContext = Depends(get_ctx)
     session = ctx.sessions.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session.shared_from and not ctx.settings.shared_in_obsidian:
+        raise HTTPException(
+            status_code=409,
+            detail="Meetings shared with you are not written to Obsidian"
+            " (Settings: shared_in_obsidian)",
+        )
     history.log_access(ctx, session_id, "exported")
 
     try:
@@ -279,10 +292,14 @@ async def export_all_to_obsidian(ctx: AppContext = Depends(get_ctx)):
         raise HTTPException(status_code=400, detail="Obsidian vault path not configured")
     if any(j.kind == "obsidian_export_all" for j in ctx.jobs.list(active_only=True)):
         raise HTTPException(status_code=409, detail="The meetings are already being exported")
+    shared = ctx.settings.shared_in_obsidian  # meetings shared with me: only when asked for
     wanted = [
         s
         for s in ctx.repo.list_summaries()
-        if s.has_summary and not s.origin and access.can_write(s.owner_id)
+        if s.has_summary
+        and not s.origin
+        and access.can_write(s.owner_id)
+        and (shared or not s.shared_from)
     ]
 
     async def run(job) -> dict:

@@ -573,6 +573,101 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Contacts */
+        get: operations["list_contacts_api_contacts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/contacts/codes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Code
+         * @description A one-time contact code: the other person pastes the invite in their own app.
+         */
+        post: operations["create_code_api_contacts_codes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/contacts/pair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Pair */
+        post: operations["pair_api_contacts_pair_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/contacts/{person}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove */
+        delete: operations["remove_api_contacts__person__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Rename
+         * @description Call a contact what you like here; an empty name goes back to the one on their card.
+         */
+        patch: operations["rename_api_contacts__person__patch"];
+        trace?: never;
+    };
+    "/api/contacts/{person}/pull": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pull
+         * @description Pull what this contact shares now and say how it went (it waits for the round).
+         */
+        post: operations["pull_api_contacts__person__pull_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/decisions": {
         parameters: {
             query?: never;
@@ -647,6 +742,24 @@ export interface paths {
          * @description Take one meeting's decision out of an object. Returns it as an object of its own.
          */
         delete: operations["unlink_decision_mention_api_decisions__key__mentions__session_id___decision_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/demo/share": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Seed Share */
+        post: operations["seed_share_api_demo_share_post"];
+        /** Remove Share */
+        delete: operations["remove_share_api_demo_share_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1242,6 +1355,26 @@ export interface paths {
         };
         /** Get Person */
         get: operations["get_person_api_people__name__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/publications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Publications
+         * @description Live publications of the meetings the caller can see, newest first.
+         */
+        get: operations["list_publications_api_publications_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1963,6 +2096,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sessions/{session_id}/guest-notes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Guest Notes
+         * @description The meeting's guest notes room (live or ended), or null (200) when there is none or it
+         *     was stopped. The link only for its owner or an admin.
+         */
+        get: operations["get_guest_notes_api_sessions__session_id__guest_notes_get"];
+        /**
+         * Start Guest Notes
+         * @description Open the meeting's notes to guests: the live room, or a new one (an ended room is
+         *     replaced). 403 when not the owner (or, on a team server, not allowed there), 409 when it
+         *     cannot start (no host, no sidecar, a shared meeting), 502 when the host refuses.
+         */
+        put: operations["start_guest_notes_api_sessions__session_id__guest_notes_put"];
+        post?: never;
+        /**
+         * Stop Guest Notes
+         * @description Stop: the room is deleted from its host at once, live or ended, and the link dies.
+         *     Returns the room with state "stopped" (no link). 404 when there is none.
+         */
+        delete: operations["stop_guest_notes_api_sessions__session_id__guest_notes_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/guest-notes/end": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End Guest Notes
+         * @description End the room: guests keep reading until it expires (24 h), nobody can type. 404 when
+         *     the meeting has no live room.
+         */
+        post: operations["end_guest_notes_api_sessions__session_id__guest_notes_end_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/guest-notes/new-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * New Guest Notes Link
+         * @description A new room and key: the old link stops working and its guests are gone. 404 when the
+         *     meeting has no guest notes.
+         */
+        post: operations["new_guest_notes_link_api_sessions__session_id__guest_notes_new_link_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/history": {
         parameters: {
             query?: never;
@@ -2106,6 +2313,204 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sessions/{session_id}/notes-items/{item_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update Notes Item
+         * @description Tick, star or date an action item from the meeting's notes (services/notes_items.py).
+         *     403 "Tick it in the notes" on a meeting someone shared with me; 409 when the notes could
+         *     not take the tick.
+         */
+        patch: operations["update_notes_item_api_sessions__session_id__notes_items__item_id__patch"];
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/peer-shares": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Peer Shares */
+        get: operations["list_peer_shares_api_sessions__session_id__peer_shares_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/peer-shares/{person}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Peer Share
+         * @description Share the meeting with this contact (or change what they have of it). The recipient's
+         *     next pull gets the new document.
+         */
+        put: operations["put_peer_share_api_sessions__session_id__peer_shares__person__put"];
+        post?: never;
+        /**
+         * Delete Peer Share
+         * @description Stop sharing the meeting with this contact; their next pull tells them to forget it.
+         */
+        delete: operations["delete_peer_share_api_sessions__session_id__peer_shares__person__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Publication
+         * @description The meeting's live publication, or null. Its link only for its owner or an admin.
+         */
+        get: operations["get_publication_api_sessions__session_id__publication_get"];
+        /**
+         * Publish
+         * @description Publish the meeting, or update its publication (same link): a `publish` job, whose
+         *     result is {publication}.
+         */
+        put: operations["publish_api_sessions__session_id__publication_put"];
+        post?: never;
+        /**
+         * Unpublish
+         * @description Unpublish: the hosted copy and this computer's files are deleted, the link dies.
+         */
+        delete: operations["unpublish_api_sessions__session_id__publication_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication/defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Publication Defaults
+         * @description What to publish: the live publication's selection, else the defaults; and who could
+         *     open a link to this computer (`local_reach`).
+         */
+        get: operations["publication_defaults_api_sessions__session_id__publication_defaults_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export File
+         * @description The publication as one HTML file: a `publication_file` job whose result is
+         *     {token, filename, size}, downloaded once from .../publication/file/{token}. Not a
+         *     publication (nothing to update or unpublish).
+         */
+        post: operations["export_file_api_sessions__session_id__publication_file_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication/file/{token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download File
+         * @description The file a `publication_file` job made, as a download; it is deleted afterwards.
+         */
+        get: operations["download_file_api_sessions__session_id__publication_file__token__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication/file/{token}/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save File
+         * @description Write the made file to a path the desktop app's save dialog chose (as a clip's save,
+         *     routes/clips.py), then delete it. Only for a client on this computer: in server mode the
+         *     path would be on the server. Who may is the download's rule (its maker, or an admin).
+         */
+        post: operations["save_file_api_sessions__session_id__publication_file__token__save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/publication/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview Publication
+         * @description The manifest readers would get, unsealed; quotes' clips as `preview_url`.
+         */
+        post: operations["preview_publication_api_sessions__session_id__publication_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/records": {
         parameters: {
             query?: never;
@@ -2216,6 +2621,26 @@ export interface paths {
          * @description Split at a character offset; times split in proportion to text length.
          */
         post: operations["split_segment_api_sessions__session_id__segments__idx__split_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/share-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Share Status
+         * @description 404 for a meeting that is not shared with this person.
+         */
+        get: operations["share_status_api_sessions__session_id__share_status_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2496,6 +2921,118 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/share/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Card
+         * @description The calling contact's newer card (its machines changed). Taken only when it is signed by
+         *     that contact's own key and newer than the one held; its machines get their CONTACT
+         *     devices. 400 for anything else.
+         */
+        post: operations["card_api_share_card_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/share/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Changes
+         * @description The meetings shared with the calling contact that changed after `since` (this computer's
+         *     change counter), whole and signed, oldest change first; and what it must forget since
+         *     `tombstones_since` (ISO time on this computer's clock): shares withdrawn and shared meetings
+         *     deleted. Only this contact's shares are ever read.
+         */
+        get: operations["changes_api_share_changes_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/share/contributions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Contributions
+         * @description What the calling contact did on meetings shared with them: signed records (comments,
+         *     action-item ticks and stars, live notes frames), applied in order as that contact through
+         *     the usual rules. One result per record; a refused record has a reason and the rest still
+         *     go. Records are idempotent by id. 413 over 200 records or 2 MB of frames.
+         */
+        post: operations["contributions_api_share_contributions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/share/hello": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Hello
+         * @description Who this is and which sharing protocol it speaks; a recipient asks first in every round.
+         */
+        get: operations["hello_api_share_hello_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/share/poke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Poke
+         * @description The calling contact has news: what it shares with this person is pulled now, in the
+         *     background (services/share_pull.py). A contact that shares nothing gives an empty round.
+         *     `wait`: answer once that round is over (at most WAIT_SECONDS), for a contact that is about
+         *     to be removed and whose token stops working right after: its tombstones must be pulled
+         *     first.
+         */
+        post: operations["poke_api_share_poke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/speakers": {
         parameters: {
             query?: never;
@@ -2649,6 +3186,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/sync/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Contacts
+         * @description Every contact of this library, removed ones included, complete: card and shared secret too,
+         *     because the computer asking is another of this person's (a paired sync peer). The runtime
+         *     state of each contact (dialed machines, cursors) stays here. One step of every sync round.
+         */
+        get: operations["get_contacts_api_sync_contacts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sync/hello": {
         parameters: {
             query?: never;
@@ -2742,6 +3301,34 @@ export interface paths {
          * @description Stop syncing with a computer. What it synced stays; it can pair again.
          */
         delete: operations["remove_peer_api_sync_peers__peer_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/person-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Person Key
+         * @description This person's private key, for the person's other computer that adopts it when pairing for
+         *     library sync (docs/plans/2026-10-23-phase-8-tasks.md, C5). Only a computer synced with this
+         *     one, over its paired tunnel.
+         */
+        get: operations["get_person_key_api_sync_person_key_get"];
+        /**
+         * Put Person Key
+         * @description Take the key another computer of this person offers (the pairing computer, when only it
+         *     had people data). Refused while this library has people data under a different key: that
+         *     would cut the contacts off.
+         */
+        put: operations["put_person_key_api_sync_person_key_put"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -3436,6 +4023,7 @@ export interface components {
          *     restarted, the backend may still be recording (api/app_watch.py).
          */
         ActiveRecording: {
+            clock: components["schemas"]["PartClock"] | null;
             /** Device Ids */
             device_ids: number[];
             /** Live */
@@ -3751,6 +4339,11 @@ export interface components {
             /** Issue Url */
             issue_url: string | null;
             /**
+             * Item Id
+             * @default
+             */
+            item_id: string;
+            /**
              * Mine
              * @default false
              */
@@ -3761,6 +4354,12 @@ export interface components {
             session_id: string;
             /** Session Name */
             session_name: string;
+            /**
+             * Source
+             * @default summary
+             * @enum {string}
+             */
+            source: "summary" | "notes";
             /**
              * Task Id
              * @default
@@ -3820,6 +4419,26 @@ export interface components {
             binary: string;
             /** Node Id */
             node_id: number;
+        };
+        /** Card */
+        Card: {
+            /** At */
+            at: string;
+            /** Machines */
+            machines: components["schemas"]["CardMachine"][];
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+            /** Sig */
+            sig: string;
+        };
+        /** CardMachine */
+        CardMachine: {
+            /** Name */
+            name: string;
+            /** Ticket */
+            ticket: string;
         };
         /** Chapter */
         Chapter: {
@@ -3919,7 +4538,7 @@ export interface components {
              * @default phone
              * @enum {string}
              */
-            kind: "phone" | "desktop" | "sync";
+            kind: "phone" | "desktop" | "sync" | "contact";
         };
         /** CombineRequest */
         CombineRequest: {
@@ -4104,6 +4723,135 @@ export interface components {
             /** Trackers */
             trackers: ("github" | "linear" | "jira")[];
         };
+        /** ContactInfo */
+        ContactInfo: {
+            /** Card Name */
+            card_name: string;
+            /** Created At */
+            created_at: string;
+            /** Fingerprint */
+            fingerprint: string;
+            /** Machines */
+            machines: string[];
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+            /** Pid */
+            pid: string;
+            pull: components["schemas"]["ContactPullInfo"] | null;
+            /** Updated At */
+            updated_at: string;
+        };
+        /** ContactPairRequest */
+        ContactPairRequest: {
+            /** Invite */
+            invite: string;
+        };
+        /**
+         * ContactPullInfo
+         * @description How pulling what this contact shares went last (services/share_pull.py).
+         */
+        ContactPullInfo: {
+            /** At */
+            at: string | null;
+            /** Error */
+            error: string | null;
+            /** State */
+            state: string;
+        };
+        /** ContactRename */
+        ContactRename: {
+            /**
+             * Name
+             * @default
+             */
+            name: string;
+        };
+        /** ContactsMe */
+        ContactsMe: {
+            /** Fingerprint */
+            fingerprint: string;
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+            /** Pid */
+            pid: string;
+        };
+        /** ContactsResponse */
+        ContactsResponse: {
+            /** Contacts */
+            contacts: components["schemas"]["ContactInfo"][];
+            me: components["schemas"]["ContactsMe"];
+        };
+        /**
+         * Contribution
+         * @description One signed piece of work by a recipient on a meeting shared with them.
+         *
+         *     `sig` is the author's Ed25519 signature (hex) of `PersonKeys.canonical` of this record's
+         *     JSON without `sig` (`model_dump(mode="json", exclude={"sig"})`: id, kind, session_id,
+         *     payload, author, at). The payload by kind:
+         *
+         *     - comment: `{op: "create"|"edit"|"delete"|"resolve"|"reopen", comment_id, ...}`; create
+         *       adds the CommentCreate fields (target, target_id, parent_id, text, idx, idx_to, seconds,
+         *       exact, prefix, suffix, notes_ids) and `comment_id` is minted by the sender (12 hex);
+         *       edit adds `text`; the others nothing.
+         *     - item_flag: `{item_id, flag: "done"|"follow", value: bool}`.
+         *     - notes_frames: `{frame_hashes: [sha256 hex, ...]}` in order; the frames travel beside the
+         *       records in `ContributionBatch.frames`, so the signature covers them by hash.
+         */
+        Contribution: {
+            /** At */
+            at: string;
+            /** Author */
+            author: string;
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "comment" | "item_flag" | "notes_frames";
+            /** Payload */
+            payload?: {
+                [key: string]: unknown;
+            };
+            /** Session Id */
+            session_id: string;
+            /** Sig */
+            sig: string;
+        };
+        /**
+         * ContributionBatch
+         * @description Records in the order they were made (FIFO per meeting), and the notes frames they list:
+         *     sha256 hex of the frame's bytes -> the bytes in base64.
+         */
+        ContributionBatch: {
+            /** Frames */
+            frames?: {
+                [key: string]: string;
+            };
+            /** Records */
+            records?: components["schemas"]["Contribution"][];
+        };
+        /** ContributionResponse */
+        ContributionResponse: {
+            /** Results */
+            results: components["schemas"]["ContributionResult"][];
+        };
+        /** ContributionResult */
+        ContributionResult: {
+            /** Id */
+            id: string;
+            /** Ok */
+            ok: boolean;
+            /**
+             * Reason
+             * @default
+             */
+            reason: string;
+        };
         /** CopilotAskRequest */
         CopilotAskRequest: {
             /** Question */
@@ -4257,6 +5005,13 @@ export interface components {
             session_id: string;
             /** What */
             what: string;
+        };
+        /** DemoShare */
+        DemoShare: {
+            /** Person */
+            person: string;
+            /** Session Id */
+            session_id: string;
         };
         /** DesktopCalendar */
         DesktopCalendar: {
@@ -4460,6 +5215,72 @@ export interface components {
             correct: string;
             /** Heard */
             heard: string;
+        };
+        /** GuestRoom */
+        GuestRoom: {
+            /** Created At */
+            created_at: string;
+            /**
+             * Ended At
+             * @default
+             */
+            ended_at: string;
+            /**
+             * Expires At
+             * @default
+             */
+            expires_at: string;
+            /**
+             * Guests Present
+             * @default []
+             */
+            guests_present: string[];
+            /** Host Url */
+            host_url: string;
+            /**
+             * Mirror Host Url
+             * @default
+             */
+            mirror_host_url: string;
+            /**
+             * Page Origin
+             * @default
+             */
+            page_origin: string;
+            /**
+             * Public Url
+             * @default
+             */
+            public_url: string;
+            /**
+             * Relay
+             * @default
+             */
+            relay: string;
+            /**
+             * Relay Kind
+             * @default none
+             * @enum {string}
+             */
+            relay_kind: "n0" | "ours" | "custom" | "none";
+            /**
+             * Started By
+             * @default
+             */
+            started_by: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "live" | "ended" | "stopped";
+            /**
+             * Transport
+             * @default host
+             * @enum {string}
+             */
+            transport: "iroh" | "tunnel" | "host";
+            /** Url */
+            url: string | null;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -4973,6 +5794,77 @@ export interface components {
             /** Text */
             text: string;
         };
+        /**
+         * NotesItem
+         * @description An action item typed in the meeting's live notes (phase 11): a task line with a person
+         *     chip (services/notes_items.py). `text`, `owner`, `at` and `done` are derived from the line
+         *     at each fold; `follow`, `due`, `issue_url` and `task_id` are state kept across folds. `id`
+         *     is 16 hex from the line id (task key `<session>:<id>`).
+         */
+        NotesItem: {
+            /** At */
+            at: number | null;
+            /**
+             * By
+             * @default
+             */
+            by: string;
+            /**
+             * Done
+             * @default false
+             */
+            done: boolean;
+            /** Due */
+            due: string | null;
+            /**
+             * Follow
+             * @default false
+             */
+            follow: boolean;
+            /**
+             * Id
+             * @default
+             */
+            id: string;
+            /** Issue Url */
+            issue_url: string | null;
+            /** Line */
+            line: string;
+            /**
+             * Live
+             * @default false
+             */
+            live: boolean;
+            /** Owner */
+            owner: string | null;
+            /**
+             * Source
+             * @default notes
+             * @constant
+             */
+            source: "notes";
+            /**
+             * Task Id
+             * @default
+             */
+            task_id: string;
+            /** Text */
+            text: string;
+        };
+        /**
+         * NotesItemUpdate
+         * @description What to change on an action item typed in the notes; fields left out stay. `done` and
+         *     `follow` need read access (done is written into the notes, as a tick there), `due` (null
+         *     clears it) write access. Text and owner change in the notes only.
+         */
+        NotesItemUpdate: {
+            /** Done */
+            done?: boolean | null;
+            /** Due */
+            due?: string | null;
+            /** Follow */
+            follow?: boolean | null;
+        };
         /** NotesRequest */
         NotesRequest: {
             /** Notes */
@@ -5179,6 +6071,19 @@ export interface components {
             urls: string[];
         };
         /**
+         * PartClock
+         * @description Where a recording in progress is on its meeting's timeline (services/parts.py
+         *     `recording_clock`): time chips in the notes are (part, seconds since `started_at`).
+         */
+        PartClock: {
+            /** Offset */
+            offset: number;
+            /** Part */
+            part: number;
+            /** Started At */
+            started_at: string;
+        };
+        /**
          * Passage
          * @description A contiguous run of transcript lines (or a session summary) retrieved for a question.
          */
@@ -5222,6 +6127,21 @@ export interface components {
             start: number;
             /** Text */
             text: string;
+        };
+        /**
+         * PeerShareInfo
+         * @description A live share of a meeting with a contact.
+         */
+        PeerShareInfo: {
+            /** At */
+            at: string;
+            /** Name */
+            name: string;
+            parts: components["schemas"]["ShareParts-Output"];
+            /** Person */
+            person: string;
+            /** Updated At */
+            updated_at: string;
         };
         /**
          * PendingRecording
@@ -5330,6 +6250,286 @@ export interface components {
             /** Provider */
             provider: string;
         };
+        /** Publication */
+        Publication: {
+            /** Behind */
+            behind: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Expires At */
+            expires_at: string | null;
+            /** Host Url */
+            host_url: string;
+            /** Id */
+            id: string;
+            /**
+             * Local Reach
+             * @enum {string}
+             */
+            local_reach: "team" | "phone_url" | "this_device";
+            /** Published By */
+            published_by: string;
+            selection: components["schemas"]["PublicationSelection-Output"];
+            /** Served By */
+            served_by: string | null;
+            /** Session Id */
+            session_id: string;
+            /** Unpublished At */
+            unpublished_at: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Url */
+            url: string | null;
+            /** Version */
+            version: number;
+            /**
+             * Where
+             * @enum {string}
+             */
+            where: "local" | "host";
+        };
+        /**
+         * PublicationDefaults
+         * @description A selection to start the Publish dialog from (send it back as a selection), and who
+         *     could open a link to this computer.
+         */
+        PublicationDefaults: {
+            /**
+             * Action Items
+             * @default true
+             */
+            action_items: boolean;
+            /** Attendees */
+            attendees: string[];
+            /**
+             * Chapters
+             * @default true
+             */
+            chapters: boolean;
+            /**
+             * Decisions
+             * @default true
+             */
+            decisions: boolean;
+            /**
+             * Expires Days
+             * @default 90
+             */
+            expires_days: number | null;
+            /**
+             * Hide Identifiers
+             * @default true
+             */
+            hide_identifiers: boolean;
+            /**
+             * Local Reach
+             * @enum {string}
+             */
+            local_reach: "team" | "phone_url" | "this_device";
+            /** Local Url */
+            local_url: string;
+            /**
+             * Names
+             * @default as_is
+             * @enum {string}
+             */
+            names: "as_is" | "first" | "hidden";
+            /**
+             * Notes
+             * @default false
+             */
+            notes: boolean;
+            /**
+             * Questions
+             * @default true
+             */
+            questions: boolean;
+            /** Quotes */
+            quotes: components["schemas"]["QuoteSpan-Output"][];
+            /**
+             * Summary
+             * @default true
+             */
+            summary: boolean;
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Topics
+             * @default true
+             */
+            topics: boolean;
+            /**
+             * Where
+             * @default local
+             * @enum {string}
+             */
+            where: "local" | "host";
+        };
+        /** PublicationFileRequest */
+        PublicationFileRequest: {
+            /** Password */
+            password?: string | null;
+            selection: components["schemas"]["PublicationSelection-Input"];
+        };
+        /** PublicationListItem */
+        PublicationListItem: {
+            publication: components["schemas"]["Publication"];
+            /** Session Name */
+            session_name: string;
+        };
+        /**
+         * PublicationSelection
+         * @description What a publication shows. The transcript is never published: only quotes' lines.
+         */
+        "PublicationSelection-Input": {
+            /**
+             * Action Items
+             * @default true
+             */
+            action_items: boolean;
+            /** Attendees */
+            attendees?: string[];
+            /**
+             * Chapters
+             * @default true
+             */
+            chapters: boolean;
+            /**
+             * Decisions
+             * @default true
+             */
+            decisions: boolean;
+            /**
+             * Expires Days
+             * @default 90
+             */
+            expires_days: number | null;
+            /**
+             * Hide Identifiers
+             * @default true
+             */
+            hide_identifiers: boolean;
+            /**
+             * Names
+             * @default as_is
+             * @enum {string}
+             */
+            names: "as_is" | "first" | "hidden";
+            /**
+             * Notes
+             * @default false
+             */
+            notes: boolean;
+            /**
+             * Questions
+             * @default true
+             */
+            questions: boolean;
+            /** Quotes */
+            quotes?: components["schemas"]["QuoteSpan-Input"][];
+            /**
+             * Summary
+             * @default true
+             */
+            summary: boolean;
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Topics
+             * @default true
+             */
+            topics: boolean;
+            /**
+             * Where
+             * @default local
+             * @enum {string}
+             */
+            where: "local" | "host";
+        };
+        /**
+         * PublicationSelection
+         * @description What a publication shows. The transcript is never published: only quotes' lines.
+         */
+        "PublicationSelection-Output": {
+            /**
+             * Action Items
+             * @default true
+             */
+            action_items: boolean;
+            /** Attendees */
+            attendees: string[];
+            /**
+             * Chapters
+             * @default true
+             */
+            chapters: boolean;
+            /**
+             * Decisions
+             * @default true
+             */
+            decisions: boolean;
+            /**
+             * Expires Days
+             * @default 90
+             */
+            expires_days: number | null;
+            /**
+             * Hide Identifiers
+             * @default true
+             */
+            hide_identifiers: boolean;
+            /**
+             * Names
+             * @default as_is
+             * @enum {string}
+             */
+            names: "as_is" | "first" | "hidden";
+            /**
+             * Notes
+             * @default false
+             */
+            notes: boolean;
+            /**
+             * Questions
+             * @default true
+             */
+            questions: boolean;
+            /** Quotes */
+            quotes: components["schemas"]["QuoteSpan-Output"][];
+            /**
+             * Summary
+             * @default true
+             */
+            summary: boolean;
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Topics
+             * @default true
+             */
+            topics: boolean;
+            /**
+             * Where
+             * @default local
+             * @enum {string}
+             */
+            where: "local" | "host";
+        };
         /** QueueItem */
         QueueItem: {
             /**
@@ -5361,6 +6561,44 @@ export interface components {
             clip: components["schemas"]["Clip"] | null;
             /** Text */
             text: string;
+        };
+        /**
+         * QuoteSpan
+         * @description A stretch of the meeting to quote: the transcript lines whose middle falls inside it,
+         *     and, with `with_clip`, that stretch of audio. Seconds on the meeting's joined timeline, or,
+         *     when `part` is set, seconds into that part (like bookmarks and comments).
+         */
+        "QuoteSpan-Input": {
+            /** End */
+            end: number;
+            /** Part */
+            part?: number | null;
+            /** Start */
+            start: number;
+            /**
+             * With Clip
+             * @default false
+             */
+            with_clip: boolean;
+        };
+        /**
+         * QuoteSpan
+         * @description A stretch of the meeting to quote: the transcript lines whose middle falls inside it,
+         *     and, with `with_clip`, that stretch of audio. Seconds on the meeting's joined timeline, or,
+         *     when `part` is set, seconds into that part (like bookmarks and comments).
+         */
+        "QuoteSpan-Output": {
+            /** End */
+            end: number;
+            /** Part */
+            part: number | null;
+            /** Start */
+            start: number;
+            /**
+             * With Clip
+             * @default false
+             */
+            with_clip: boolean;
         };
         /**
          * Recording
@@ -5415,8 +6653,12 @@ export interface components {
         };
         /** RedeemResponse */
         RedeemResponse: {
+            /** Card */
+            card: {
+                [key: string]: unknown;
+            } | null;
             device: components["schemas"]["PairedDeviceInfo"];
-            sync: components["schemas"]["SyncSelf"] | null;
+            sync: components["schemas"]["SyncRedeemSelf"] | null;
             /** Token */
             token: string;
         };
@@ -5559,6 +6801,11 @@ export interface components {
             /** Path */
             path: string;
         };
+        /** SavePublicationFileRequest */
+        SavePublicationFileRequest: {
+            /** Path */
+            path: string;
+        };
         /** SearchHit */
         SearchHit: {
             /** Comments */
@@ -5696,6 +6943,8 @@ export interface components {
              * @default
              */
             notes: string;
+            /** Notes Items */
+            notes_items: components["schemas"]["NotesItem"][];
             /**
              * Origin
              * @default
@@ -5710,6 +6959,11 @@ export interface components {
             participants: string[];
             /** Recordings */
             recordings: components["schemas"]["Recording"][];
+            /**
+             * Shared From
+             * @default
+             */
+            shared_from: string;
             /**
              * Speakers Reviewed
              * @default false
@@ -5830,6 +7084,11 @@ export interface components {
             owner_id: string;
             /** Participant Count */
             participant_count: number;
+            /**
+             * Shared From
+             * @default
+             */
+            shared_from: string;
             status: components["schemas"]["SessionStatus"];
             /**
              * Updated At
@@ -5871,6 +7130,10 @@ export interface components {
         };
         /** SettingsUpdate */
         SettingsUpdate: {
+            /** Allow Guest Notes */
+            allow_guest_notes?: boolean | null;
+            /** Allow Publishing */
+            allow_publishing?: boolean | null;
             /** Anthropic Api Key */
             anthropic_api_key?: string | null;
             /** Api Token */
@@ -5953,6 +7216,14 @@ export interface components {
             glossary_llm_correct?: boolean | null;
             /** Gpu Support */
             gpu_support?: string | null;
+            /** Guest Host */
+            guest_host?: string | null;
+            /** Guest Notes End Hours */
+            guest_notes_end_hours?: number | null;
+            /** Guest Page Url */
+            guest_page_url?: string | null;
+            /** Guest Transport */
+            guest_transport?: ("auto" | "iroh" | "tunnel" | "host") | null;
             /** Hf Token */
             hf_token?: string | null;
             /** Hubspot Auto Push */
@@ -6061,6 +7332,12 @@ export interface components {
             phone_url?: string | null;
             /** Phonon Command */
             phonon_command?: string | null;
+            /** Publish Default Expiry Days */
+            publish_default_expiry_days?: number | null;
+            /** Publish Host */
+            publish_host?: string | null;
+            /** Publish Host Token */
+            publish_host_token?: string | null;
             /** Records Retention Years */
             records_retention_years?: number | null;
             /** Redact Exports */
@@ -6091,6 +7368,14 @@ export interface components {
             share_on_network?: boolean | null;
             /** Share With Invitees */
             share_with_invitees?: boolean | null;
+            /** Shared In Ask */
+            shared_in_ask?: boolean | null;
+            /** Shared In Digest */
+            shared_in_digest?: boolean | null;
+            /** Shared In Obsidian */
+            shared_in_obsidian?: boolean | null;
+            /** Shared In Search */
+            shared_in_search?: boolean | null;
             /** Slack Webhook Url */
             slack_webhook_url?: string | null;
             /** Speaker Match Threshold */
@@ -6136,6 +7421,10 @@ export interface components {
         };
         /** SettingsValues */
         SettingsValues: {
+            /** Allow Guest Notes */
+            allow_guest_notes: boolean;
+            /** Allow Publishing */
+            allow_publishing: boolean;
             /** Anthropic Api Key */
             anthropic_api_key: string;
             /** Api Token */
@@ -6224,6 +7513,17 @@ export interface components {
             glossary_llm_correct: boolean;
             /** Gpu Support */
             gpu_support: string;
+            /** Guest Host */
+            guest_host: string;
+            /** Guest Notes End Hours */
+            guest_notes_end_hours: number;
+            /** Guest Page Url */
+            guest_page_url: string;
+            /**
+             * Guest Transport
+             * @enum {string}
+             */
+            guest_transport: "auto" | "iroh" | "tunnel" | "host";
             /** Hf Token */
             hf_token: string;
             /** Hubspot Auto Push */
@@ -6335,6 +7635,12 @@ export interface components {
             phone_url: string;
             /** Phonon Command */
             phonon_command: string;
+            /** Publish Default Expiry Days */
+            publish_default_expiry_days: number;
+            /** Publish Host */
+            publish_host: string;
+            /** Publish Host Token */
+            publish_host_token: string;
             /** Records Retention Years */
             records_retention_years: number;
             /** Redact Exports */
@@ -6365,6 +7671,14 @@ export interface components {
             share_on_network: boolean;
             /** Share With Invitees */
             share_with_invitees: boolean;
+            /** Shared In Ask */
+            shared_in_ask: boolean;
+            /** Shared In Digest */
+            shared_in_digest: boolean;
+            /** Shared In Obsidian */
+            shared_in_obsidian: boolean;
+            /** Shared In Search */
+            shared_in_search: boolean;
             /** Slack Webhook Url */
             slack_webhook_url: string;
             /** Speaker Match Threshold */
@@ -6411,12 +7725,298 @@ export interface components {
             /** Whisper Vad */
             whisper_vad: string;
         };
+        /**
+         * ShareChanges
+         * @description A page of what changed for the calling contact: whole signed meetings, oldest change
+         *     first, and what it must forget. Ask again from `next_since` while `more`;
+         *     `tombstones_next` is the `tombstones_since` for the next round.
+         */
+        ShareChanges: {
+            /** More */
+            more: boolean;
+            /** Next Since */
+            next_since: number;
+            /** Sessions */
+            sessions: components["schemas"]["SharedMeeting"][];
+            /** Tombstones */
+            tombstones: components["schemas"]["ShareTombstone"][];
+            /** Tombstones Next */
+            tombstones_next: string;
+        };
+        /** ShareHello */
+        ShareHello: {
+            /** App Version */
+            app_version: string;
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+            /** Protocol */
+            protocol: number;
+        };
+        /**
+         * ShareOwner
+         * @description Who shared a meeting with this person.
+         */
+        ShareOwner: {
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+        };
+        /**
+         * ShareParts
+         * @description What of a meeting a share includes (the stored `peer_shares.parts`, and the sharing
+         *     dialog's request). The title and date always travel. The transcript is off by default: it
+         *     cannot be taken back once sent. `hide_identifiers` redacts account, card and social security
+         *     numbers, dates of birth, e-mail addresses and phone numbers in the summary and the
+         *     transcript (not in the notes or comments).
+         */
+        "ShareParts-Input": {
+            /**
+             * Action Items
+             * @default true
+             */
+            action_items: boolean;
+            /**
+             * Attendees
+             * @default true
+             */
+            attendees: boolean;
+            /**
+             * Chapters
+             * @default true
+             */
+            chapters: boolean;
+            /**
+             * Decisions
+             * @default true
+             */
+            decisions: boolean;
+            /**
+             * Hide Identifiers
+             * @default false
+             */
+            hide_identifiers: boolean;
+            /**
+             * Notes
+             * @default true
+             */
+            notes: boolean;
+            /**
+             * Questions
+             * @default true
+             */
+            questions: boolean;
+            /**
+             * Summary
+             * @default true
+             */
+            summary: boolean;
+            /**
+             * Topics
+             * @default true
+             */
+            topics: boolean;
+            /**
+             * Transcript
+             * @default false
+             */
+            transcript: boolean;
+        };
+        /**
+         * ShareParts
+         * @description What of a meeting a share includes (the stored `peer_shares.parts`, and the sharing
+         *     dialog's request). The title and date always travel. The transcript is off by default: it
+         *     cannot be taken back once sent. `hide_identifiers` redacts account, card and social security
+         *     numbers, dates of birth, e-mail addresses and phone numbers in the summary and the
+         *     transcript (not in the notes or comments).
+         */
+        "ShareParts-Output": {
+            /**
+             * Action Items
+             * @default true
+             */
+            action_items: boolean;
+            /**
+             * Attendees
+             * @default true
+             */
+            attendees: boolean;
+            /**
+             * Chapters
+             * @default true
+             */
+            chapters: boolean;
+            /**
+             * Decisions
+             * @default true
+             */
+            decisions: boolean;
+            /**
+             * Hide Identifiers
+             * @default false
+             */
+            hide_identifiers: boolean;
+            /**
+             * Notes
+             * @default true
+             */
+            notes: boolean;
+            /**
+             * Questions
+             * @default true
+             */
+            questions: boolean;
+            /**
+             * Summary
+             * @default true
+             */
+            summary: boolean;
+            /**
+             * Topics
+             * @default true
+             */
+            topics: boolean;
+            /**
+             * Transcript
+             * @default false
+             */
+            transcript: boolean;
+        };
         /** SharePerson */
         SharePerson: {
             /** Id */
             id: string;
             /** Name */
             name: string;
+        };
+        /**
+         * ShareRejected
+         * @description Something the owner's computer refused, and why.
+         */
+        ShareRejected: {
+            /** At */
+            at: string;
+            /** Excerpt */
+            excerpt: string;
+            /** Kind */
+            kind: string;
+            /** Reason */
+            reason: string;
+        };
+        /**
+         * ShareStatus
+         * @description How this person's work on a meeting shared with them stands (services/share_push.py).
+         */
+        ShareStatus: {
+            owner: components["schemas"]["ShareOwner"];
+            parts: components["schemas"]["ShareParts-Output"];
+            /** Rejected */
+            rejected: components["schemas"]["ShareRejected"][];
+            waiting: components["schemas"]["ShareWaiting"];
+        };
+        /** ShareTombstone */
+        ShareTombstone: {
+            /** At */
+            at: string;
+            /** Reason */
+            reason: string;
+            /** Session Id */
+            session_id: string;
+        };
+        /**
+         * ShareWaiting
+         * @description What this person did on the meeting that its owner's computer has not taken yet.
+         */
+        ShareWaiting: {
+            /** Comments */
+            comments: number;
+            /** Notes */
+            notes: boolean;
+            /** Ticks */
+            ticks: number;
+        };
+        /** SharedMeeting */
+        SharedMeeting: {
+            /** Attendees */
+            attendees: string[];
+            /** Comments */
+            comments: components["schemas"]["SyncComment"][];
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Digest
+             * @default
+             */
+            digest: string;
+            /**
+             * Format
+             * @default 1
+             */
+            format: number;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Notes
+             * @default
+             */
+            notes: string;
+            /**
+             * Notes Doc
+             * @default
+             */
+            notes_doc: string;
+            owner: components["schemas"]["SharedOwner"];
+            /** Participants */
+            participants: string[];
+            parts: components["schemas"]["ShareParts-Output"];
+            /** Shared With */
+            shared_with: string[];
+            /**
+             * Sig
+             * @default
+             */
+            sig: string;
+            /**
+             * Summary
+             * @default
+             */
+            summary: string;
+            summary_data: components["schemas"]["SummaryData"] | null;
+            /** Transcript */
+            transcript: components["schemas"]["SharedSegment"][];
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** SharedOwner */
+        SharedOwner: {
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+        };
+        /**
+         * SharedSegment
+         * @description A transcript line on the meeting's joined timeline (no words, no audio references).
+         */
+        SharedSegment: {
+            /** End */
+            end: number;
+            /** Speaker */
+            speaker: string;
+            /** Start */
+            start: number;
+            /** Text */
+            text: string;
         };
         /** Shares */
         Shares: {
@@ -6520,6 +8120,7 @@ export interface components {
         };
         /** StartRecordingResponse */
         StartRecordingResponse: {
+            clock: components["schemas"]["PartClock"] | null;
             /** Live Job Id */
             live_job_id: string | null;
             /** Message */
@@ -6848,6 +8449,40 @@ export interface components {
             updated_at: string;
         };
         /**
+         * SyncContact
+         * @description A contact row as it travels between one person's computers (services/contacts.py
+         *     `export_rows`): complete, secret and card included. No runtime state.
+         */
+        SyncContact: {
+            /** Card */
+            card: {
+                [key: string]: unknown;
+            };
+            /** Created At */
+            created_at: string;
+            /** My Name */
+            my_name: string;
+            /** Name */
+            name: string;
+            /** Person */
+            person: string;
+            /** Removed At */
+            removed_at: string;
+            /** Secret */
+            secret: string;
+            /** Updated At */
+            updated_at: string;
+        };
+        /** SyncContacts */
+        SyncContacts: {
+            /** Contacts */
+            contacts: components["schemas"]["SyncContact"][];
+            /** Has People Data */
+            has_people_data: boolean;
+            /** Person */
+            person: string;
+        };
+        /**
          * SyncEvent
          * @description A history event. `uid` is its identity across machines; `at` stays the stored ISO text.
          */
@@ -6901,6 +8536,8 @@ export interface components {
         /** SyncPairResponse */
         SyncPairResponse: {
             peer: components["schemas"]["SyncPeerInfo"];
+            /** Person Error */
+            person_error: string | null;
         };
         /**
          * SyncPeerInfo
@@ -6950,6 +8587,34 @@ export interface components {
              */
             token: string;
         };
+        /**
+         * SyncPeerShare
+         * @description A meeting shared with a contact (a `peer_shares` row): `person` is the contact's key,
+         *     `parts` what was chosen (an opaque dict here). Times stay the stored ISO text. A revoked
+         *     share keeps its row (`revoked_at`), so the revocation travels.
+         */
+        SyncPeerShare: {
+            /** At */
+            at: string;
+            /**
+             * By
+             * @default
+             */
+            by: string;
+            /** Parts */
+            parts: {
+                [key: string]: unknown;
+            };
+            /** Person */
+            person: string;
+            /**
+             * Revoked At
+             * @default
+             */
+            revoked_at: string;
+            /** Updated At */
+            updated_at: string;
+        };
         /** SyncPeerStatus */
         SyncPeerStatus: {
             /** App Version */
@@ -6987,6 +8652,8 @@ export interface components {
             updated: number;
             /** Waiting */
             waiting: number;
+            /** Warning */
+            warning: string | null;
         };
         /** SyncPeers */
         SyncPeers: {
@@ -6994,10 +8661,113 @@ export interface components {
             peers: components["schemas"]["SyncPeerInfo"][];
             self: components["schemas"]["SyncSelf"];
         };
+        /**
+         * SyncPerson
+         * @description The person key this computer signs with (services/person.py): computers that sync with
+         *     each other share it, so Settings can show that they are one person.
+         */
+        SyncPerson: {
+            /** Fingerprint */
+            fingerprint: string;
+            /** Pid */
+            pid: string;
+        };
+        /**
+         * SyncPersonKey
+         * @description A person's private key as hex, handed between that person's computers (never anyone else).
+         */
+        SyncPersonKey: {
+            /** Private */
+            private: string;
+        };
+        /**
+         * SyncPersonOffer
+         * @description What the computer that showed a sync code says about the person key when a sync code is
+         *     redeemed: its public key, and who adopts whose key. "mine": the redeemer takes this
+         *     computer's key; "yours": this computer takes the redeemer's; "same": nothing to do.
+         */
+        SyncPersonOffer: {
+            /**
+             * Adopt
+             * @enum {string}
+             */
+            adopt: "mine" | "yours" | "same";
+            /** Pub */
+            pub: string;
+        };
         /** SyncPokeResponse */
         SyncPokeResponse: {
             /** Scheduled */
             scheduled: boolean;
+        };
+        /**
+         * SyncPublication
+         * @description A publication row as stored (services/publishing.py), key and token included: library
+         *     sync is between one person's own computers, which must be able to update a link. Times stay
+         *     the stored ISO text. `origin`: the computer whose files serve a "this computer"
+         *     publication, as the SENDER sees it (its own sync id when it is its own).
+         */
+        SyncPublication: {
+            /** Clip Blobs */
+            clip_blobs: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
+            /** Created At */
+            created_at: string;
+            /** Expires At */
+            expires_at: string | null;
+            /**
+             * Host Url
+             * @default
+             */
+            host_url: string;
+            /** Id */
+            id: string;
+            /** Key */
+            key: string;
+            /**
+             * Origin
+             * @default
+             */
+            origin: string;
+            /**
+             * Published By
+             * @default
+             */
+            published_by: string;
+            /**
+             * Published Digest
+             * @default
+             */
+            published_digest: string;
+            selection: components["schemas"]["PublicationSelection-Output"];
+            /** Token */
+            token: string;
+            /** Unpublished At */
+            unpublished_at: string | null;
+            /** Updated At */
+            updated_at: string;
+            /** Version */
+            version: number;
+            /**
+             * Where
+             * @enum {string}
+             */
+            where: "local" | "host";
+        };
+        /**
+         * SyncRedeemSelf
+         * @description This computer, as a redeemed sync code answers (SyncSelf plus the key offer; `person` is
+         *     absent from computers before the person key).
+         */
+        SyncRedeemSelf: {
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            person: components["schemas"]["SyncPersonOffer"] | null;
         };
         /** SyncSelf */
         SyncSelf: {
@@ -7005,6 +8775,7 @@ export interface components {
             id: string;
             /** Name */
             name: string;
+            person: components["schemas"]["SyncPerson"];
         };
         /** SyncSession */
         SyncSession: {
@@ -7054,6 +8825,8 @@ export interface components {
             notes: string;
             /** Notes Doc */
             notes_doc: string | null;
+            /** Notes Items */
+            notes_items: components["schemas"]["NotesItem"][] | null;
             /** Origin */
             origin: string;
             /** Origin Audio */
@@ -7065,6 +8838,10 @@ export interface components {
             owner_id: string;
             /** Participants */
             participants: string[];
+            /** Peer Shares */
+            peer_shares: components["schemas"]["SyncPeerShare"][];
+            /** Publications */
+            publications: components["schemas"]["SyncPublication"][];
             /** Recordings */
             recordings: components["schemas"]["Recording"][];
             /** Speaker Embeddings */
@@ -7182,6 +8959,11 @@ export interface components {
             /** Issue Url */
             issue_url: string | null;
             /**
+             * Item Id
+             * @default
+             */
+            item_id: string;
+            /**
              * Mine
              * @default false
              */
@@ -7192,6 +8974,12 @@ export interface components {
             session_id: string;
             /** Session Name */
             session_name: string;
+            /**
+             * Source
+             * @default summary
+             * @enum {string}
+             */
+            source: "summary" | "notes";
             /** Text */
             text: string;
         };
@@ -7225,6 +9013,12 @@ export interface components {
             session_id: string;
             /** Session Name */
             session_name: string;
+            /**
+             * Source
+             * @default summary
+             * @enum {string}
+             */
+            source: "summary" | "notes";
             /** Text */
             text: string;
         };
@@ -7670,6 +9464,10 @@ export interface components {
         };
         /** RedeemRequest */
         mnemosyne__api__routes__pairing__RedeemRequest: {
+            /** Card */
+            card?: {
+                [key: string]: unknown;
+            } | null;
             /** Code */
             code: string;
             /** Endpoint Id */
@@ -8664,6 +10462,176 @@ export interface operations {
             };
         };
     };
+    list_contacts_api_contacts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactsResponse"];
+                };
+            };
+        };
+    };
+    create_code_api_contacts_codes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PairingCode"];
+                };
+            };
+        };
+    };
+    pair_api_contacts_pair_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactPairRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_api_contacts__person__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_api_contacts__person__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactRename"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    pull_api_contacts__person__pull_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactPullInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_decisions_api_decisions_get: {
         parameters: {
             query?: {
@@ -8824,6 +10792,44 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    seed_share_api_demo_share_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DemoShare"];
+                };
+            };
+        };
+    };
+    remove_share_api_demo_share_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -9828,6 +11834,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_publications_api_publications_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationListItem"][];
                 };
             };
         };
@@ -11286,6 +13312,161 @@ export interface operations {
             };
         };
     };
+    get_guest_notes_api_sessions__session_id__guest_notes_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRoom"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    start_guest_notes_api_sessions__session_id__guest_notes_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRoom"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stop_guest_notes_api_sessions__session_id__guest_notes_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRoom"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    end_guest_notes_api_sessions__session_id__guest_notes_end_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRoom"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    new_guest_notes_link_api_sessions__session_id__guest_notes_new_link_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRoom"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_history_api_sessions__session_id__history_get: {
         parameters: {
             query?: never;
@@ -11586,6 +13767,407 @@ export interface operations {
             };
         };
     };
+    update_notes_item_api_sessions__session_id__notes_items__item_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotesItemUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_peer_shares_api_sessions__session_id__peer_shares_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeerShareInfo"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_peer_share_api_sessions__session_id__peer_shares__person__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                person: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShareParts-Input"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeerShareInfo"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_peer_share_api_sessions__session_id__peer_shares__person__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                person: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_publication_api_sessions__session_id__publication_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Publication"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    publish_api_sessions__session_id__publication_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationSelection-Input"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unpublish_api_sessions__session_id__publication_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Publication"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    publication_defaults_api_sessions__session_id__publication_defaults_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationDefaults"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_file_api_sessions__session_id__publication_file_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    download_file_api_sessions__session_id__publication_file__token__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_file_api_sessions__session_id__publication_file__token__save_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SavePublicationFileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_publication_api_sessions__session_id__publication_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationSelection-Input"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     meeting_record_api_sessions__session_id__records_get: {
         parameters: {
             query?: never;
@@ -11806,6 +14388,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Session"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    share_status_api_sessions__session_id__share_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShareStatus"];
                 };
             };
             /** @description Validation Error */
@@ -12332,6 +14945,152 @@ export interface operations {
             };
         };
     };
+    card_api_share_card_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Card"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    changes_api_share_changes_get: {
+        parameters: {
+            query?: {
+                since?: number;
+                tombstones_since?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShareChanges"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    contributions_api_share_contributions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContributionBatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContributionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    hello_api_share_hello_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShareHello"];
+                };
+            };
+        };
+    };
+    poke_api_share_poke_post: {
+        parameters: {
+            query?: {
+                wait?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_speakers_api_speakers_get: {
         parameters: {
             query?: never;
@@ -12563,6 +15322,26 @@ export interface operations {
             };
         };
     };
+    get_contacts_api_sync_contacts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncContacts"];
+                };
+            };
+        };
+    };
     hello_api_sync_hello_get: {
         parameters: {
             query?: never;
@@ -12674,6 +15453,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_person_key_api_sync_person_key_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncPersonKey"];
+                };
+            };
+        };
+    };
+    put_person_key_api_sync_person_key_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SyncPersonKey"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncPerson"];
                 };
             };
             /** @description Validation Error */

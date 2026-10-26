@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getHistory, recoverSession } from '$lib/api/backend.js';
-	import { syncState } from '$lib/stores/sync.svelte.js';
+	import { audioReason } from '$lib/app/access.js';
 	import { sessionState } from '$lib/stores/session.svelte.js';
 	import { jobsState } from '$lib/stores/jobs.svelte.js';
 	import { toastState } from '$lib/stores/toast.svelte.js';
@@ -231,6 +231,31 @@
 				return `Flagged lines reviewed${d.by ? ` by ${d.by}` : ''}${d.note ? `: ${d.note}` : ''}`;
 			case 'consent':
 				return `${CONSENT[d.consent as string] ?? 'Consent recorded'}${d.by ? ` (${d.by})` : ''}`;
+			case 'guest_notes_started':
+				return `Guest notes started${d.by ? ` by ${d.by}` : ''}`;
+			case 'guest_notes_ended':
+				return `Guest notes ended${d.auto ? ' automatically' : ''}${d.by ? ` by ${d.by}` : ''}`;
+			case 'guest_notes_stopped':
+				return `Guest notes stopped${d.by ? ` by ${d.by}` : ''}`;
+			case 'guest_notes_mirror_failed':
+				return `Guest notes: the publish host could not be used${d.error ? ` (${d.error})` : ''}`;
+			case 'guest_notes_mirror_gone':
+				return "Guest notes: the publish host's copy was removed";
+			case 'guest_notes_link_changed':
+				return 'Guest notes link changed (new tunnel address)';
+			case 'published':
+			case 'publication_updated': {
+				// where: "this computer" or "publish host" (backend services/publishing.py _log).
+				const where = d.where === 'publish host' ? 'the publish host' : 'this computer';
+				const what = e.kind === 'published' ? 'Published' : 'Publication updated';
+				return `${what} (version ${d.version}, on ${where})${d.by ? ` by ${d.by}` : ''}`;
+			}
+			case 'unpublished':
+				return `Unpublished${d.by ? ` by ${d.by}` : ''}`;
+			case 'publication_expired':
+				return 'The publication expired';
+			case 'exported_publication':
+				return `Exported as a file${d.password ? ' (with a password)' : ''}${d.by ? ` by ${d.by}` : ''}`;
 			case 'viewed':
 			case 'played':
 			case 'exported':
@@ -291,8 +316,8 @@
 					{#if history.pending.some((p) => p.state === 'waiting')}
 						<button
 							onclick={recover}
-							disabled={recovering || history.recording_now || !!session.origin}
-							title={session.origin ? syncState.audioOn(session.origin) : history.recording_now ? 'After this recording stops' : 'Add it to the meeting as its next part'}
+							disabled={recovering || history.recording_now || !!audioReason(session)}
+							title={audioReason(session) || history.recording_now ? 'After this recording stops' : 'Add it to the meeting as its next part'}
 							class="rounded bg-amber-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
 						>Save it into the meeting</button>
 					{/if}

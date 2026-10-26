@@ -209,6 +209,25 @@ For a team that keeps its meetings as records:
   nothing changed. The zip holds the audio unencrypted: it can be downloaded once, and is removed
   from the server a day after it was made even if nobody fetches it.
 
+## Publishing
+
+Publishing a meeting (a curated, encrypted copy readers open with a link) is off on a team server
+until an admin turns on `allow_publishing`. Then a meeting's owner or an admin can publish it;
+everyone else who can read the meeting sees that it is published, not the link. Published
+meetings are served read-only by this server at `/p/<id>` (no sign-in: the key is in the link),
+or by a publish host (`publish_host`, with `publish_host_token` when the host is closed). Hosted
+links expire after `publish_default_expiry_days` (90 by default, at most 365). Unpublishing
+deletes the copy; copies readers already opened cannot be taken back.
+
+## Guest notes
+
+A link that lets people outside the team type into a live meeting's notes (see
+[guest-notes.md](guest-notes.md)) is off until an admin turns on `allow_guest_notes`. Then a
+meeting's owner or an admin can start, end and stop it. The room lives on the host in
+`guest_host` or `publish_host`, not on this server; guests' typing and comments become part of
+the meeting, and `require_consent` reminds the owner. Meetings shared from another person's
+computer cannot be opened to guests.
+
 ## Backups
 
 Settings → General → Backups: a folder on a second disk or a network share, every day, keeping at

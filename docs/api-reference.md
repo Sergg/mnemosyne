@@ -46,6 +46,19 @@ outside the database, so they are checked even while encrypted meetings are lock
   code works once. A desktop code needs `endpoint_id`, which the link sidecar sets from the
   connection's verified iroh key; a phone code must not have one. `403` when the code is unknown,
   used, expired or of the other kind (a refusal of the wrong kind does not use it up).
+- Contacts (another person's computers, services/contacts.py; admin only, `409` on a team server,
+  without an API token or without remote access): `POST /api/contacts/codes` → the same
+  `{code, kind: "contact", expires_at, urls, invite}`; `POST /api/contacts/pair` `{invite}` →
+  `ContactInfo` (the redeeming side; the other side's `POST /api/pairing/redeem` takes
+  `card: {card, secret}` for a contact code and answers `{device, token, card}` with its own card);
+  `GET /api/contacts` → `{me: {person, pid, name, fingerprint}, contacts: [{person, pid, name,
+  card_name, fingerprint, machines, created_at, updated_at, pull}]}` (`pull`: `{state, at, error}`
+  of the last pull of what they share, state idle|pulling|ok|unreachable|skew|error|gone, or null
+  when not pulled since this start; `gone`: every machine of theirs refused us three rounds in a
+  row, so their meetings were removed here); `PATCH /api/contacts/{person}` `{name}` (local name; empty = the
+  card's); `DELETE /api/contacts/{person}`; `POST /api/contacts/{person}/pull` → `{state, at,
+  error}` after pulling what that contact shares now (services/share_pull.py; `423` while locked).
+  A contact's `POST /api/share/poke` here starts such a pull in the background.
 - `GET /api/pairing/devices` → `[{id, name, kind, created_at, last_seen_at}]`. A phone's token opens
   only the phone page's paths; a computer's opens the whole API.
 - `DELETE /api/pairing/devices/{id}`: the device's token stops working at once.
@@ -302,7 +315,11 @@ Input devices are microphones. Output devices are selected to capture system aud
 (48 kHz mono 16-bit WAV), targeting nodes by name. Output devices are captured from their monitor
 ports (`stream.capture.sink=true` on the sink node). Session status becomes `recording`.
 
-**Response:** `{ "session_id": "...", "recording_id": "...", "live_job_id": "..." | null, "message": "..." }`
+**Response:** `{ "session_id": "...", "recording_id": "...", "live_job_id": "..." | null, "message": "...",
+"clock": {part, offset, started_at} | null }`. `clock` is the recording's place on the meeting's timeline
+(services/parts.py `recording_clock`): `part` it records into, `offset` where that part starts on the joined
+timeline (seconds) and `started_at` when its capture started (UTC ISO, milliseconds). The notes editor's time chips
+are `(part, seconds since started_at)`. `restart` answers with it too.
 
 When `live_transcription` is enabled a `live` job starts alongside the recording and streams
 provisional text (see WebSocket `live_*` events). It is cancelled by stop.
@@ -433,8 +450,9 @@ out; empty while `auto_record` is `off`. Changes are published as `meeting_app` 
 
 ### `GET /api/audio/active`
 Recordings in progress, so a UI that (re)connects shows them: `[{session_id, started_at (unix
-time), device_ids, part, live, live_segments: [{source, segment}]}]`. `live_segments` is the live
-transcript so far. `problems` names sources no longer being captured (see below).
+time), device_ids, part, live, live_segments: [{source, segment}], problems, clock}]`. `live_segments` is the live
+transcript so far. `problems` names sources no longer being captured (see below). `clock` is the recording's
+`{part, offset, started_at}` as in `start`.
 
 ### Capture health: `capture_health` events · `POST /api/audio/restart/{session_id}`
 While recording, each source is watched (`audio/health.py`): `stopped` when its recorder exits,
@@ -777,6 +795,103 @@ counts in the storage report and goes with the session's audio. `GET …/clips/{
 copies it to a path chosen in the desktop app's save dialog (loopback clients only, `403`
 otherwise). `400` for lines outside the transcript.
 
+### Publishing: `GET|PUT|DELETE /api/sessions/{session_id}/publication` · `POST …/publication/preview` · `GET …/publication/defaults` · `POST …/publication/file` · `GET /api/publications`
+
+A curated, encrypted copy of a meeting (services/publishing.py, format in
+services/publication_format.py). A `PublicationSelection` says what it shows: `title`, the
+booleans `summary decisions questions action_items chapters topics notes`, `attendees` (names to
+list; everyone else of the meeting becomes "Person N" everywhere), `names`
+(`as_is|first|hidden`), `hide_identifiers` (also hides e-mail addresses and phone numbers), `quotes` (`{start, end, part?, with_clip}`: joined-
+timeline seconds, or seconds into `part`; the transcript lines whose middle is inside), `where`
+(`local|host`) and `expires_days` (`null` = never, only for `local`; at most 365 on a host).
+`GET …/defaults` gives the live publication's selection, else the defaults (`publish_default_expiry_days`,
+host when `publish_host` is set), plus `local_reach` (`team|phone_url|this_device`: who could open a
+link to this computer) and `local_url` (the base such a link uses; `""` for `this_device`, where only
+127.0.0.1 works). `POST …/preview` returns the unsealed manifest, a quote's clip as
+`{preview_url, seconds, mime}` (`/api/audio/file/{id}#t=start,end`). `PUT` starts a `publish` job
+(`result.publication`); an update keeps the id, key and link and bumps `version`. `DELETE`
+unpublishes (`404` when not published). `Publication.url` (link with the key in the fragment) is
+`null` for anyone but the owner or an admin; `behind` is true when publishing again would show
+something different; `local_reach` and `published_by` say who could open it and who published. `PUT` answers
+`400` for a selection that cannot be published (no host set, no expiry on a host, clips without audio) and `409`
+"This meeting is being published already" while a `publish` job runs; `DELETE` answers `502` when the host
+could not delete the copy. `403` when `allow_publishing` is off on a team server or the caller may not
+change the meeting; `409` for clips of a meeting whose audio is on another computer ("The audio
+is on <name>"), and `409` "Published from <name>" for `PUT`/`DELETE` of a `where: "local"`
+publication whose files are on another of the person's computers (library sync): such a
+publication has `served_by: <name>` and `url: null` here; a hosted one can be changed from either
+computer. Readers (reviewers, members it is shared with) get the publication with `url: null`.
+
+`POST …/publication/file` `{ selection, password? }` (password at least 8 characters, else `400`; `503` when the
+viewer is not built in) starts a `publication_file` job: the publication as one self-contained HTML file,
+not a publication (nothing to update or unpublish, never expires; logged and sealed like one). Its result is
+`{token, filename, size}`; `GET …/publication/file/{token}` downloads it once (attachment, then it is deleted;
+`404` when gone, files are kept a day) and `POST …/publication/file/{token}/save` `{ "path": … }` writes it to a
+path chosen in the desktop app's save dialog instead (loopback clients only, `403` otherwise; `400` when the
+folder does not exist; returns `{path}`).
+
+Open (no sign-in: the key in the link is the permission), read-only, with the publish host's headers. Every
+answer has `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`; errors are JSON
+`{"error": "not_found"|"gone"}`.
+
+- `GET /p/{id}`: the viewer's `index.html` for any id (it says "not found" itself), strict CSP
+  (`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src blob:; img-src data: blob:;
+  base-uri 'none'; form-action 'none'; frame-ancestors 'none'`), `Cache-Control: no-store`; `503` with a plain
+  page when the viewer is not built into this Mnemosyne.
+- `GET /p/{folder}/{path}`: the viewer build's files (`/p/assets/index-<hash>.js|css`), same CSP,
+  `Cache-Control: no-cache`; `404` for dotfiles or anything outside the viewer folder.
+- `GET /pub/{id}`: the sealed manifest (`application/octet-stream`) with `ETag` (its SHA-256),
+  `X-Pub-Version`, `X-Pub-Expires` (unix seconds; absent when it never expires) and `Cache-Control: no-cache`;
+  `304` on a matching `If-None-Match`; `404` unknown, `410` unpublished, expired or deleted (a tombstone for 30 days).
+- `GET /pub/{id}/{sha256}`: a sealed clip, `Cache-Control: public, max-age=31536000, immutable`; `404` if the current
+  version does not hold it.
+
+### Guest notes: `GET|PUT|DELETE /api/sessions/{session_id}/guest-notes` · `POST …/guest-notes/end` · `POST …/guest-notes/new-link`
+
+Opens the meeting's live notes to people who have no Mnemosyne: a link to a page in their browser, through a
+room on a host that cannot read it (services/guest_notes.py, guest/). The host is `guest_host`, else
+`publish_host`; with neither, starting answers `409 "No host for guest notes…"`. All five answer a `GuestRoom`:
+`{ url, host_url, state: "live"|"ended"|"stopped", created_at, ended_at, expires_at, started_by, guests_present }`.
+
+- `GET` the room (live or ended), or `null` with `200` when the meeting has none or it was stopped (it is not a
+  `404`, as with `…/publication`). Anyone who can see the meeting may ask; `url` (`<host>/n/<room>#<key>`, the key is
+  in the fragment and nothing else carries it) and `guests_present` (guests' names) are filled only for the
+  meeting's owner and admins, readers get `url: null` and `[]`.
+- `PUT` opens it: the live room if there is one, else a new one (an ended room is deleted from its host first: one
+  room per meeting). Owner or admin only (`403`); on a team server also `allow_guest_notes` (off by default, `403`
+  "turned off"). `409` when it cannot start (no host, the `mnemosyne-link` sidecar is missing, the meeting was
+  shared with you, its notes have not arrived from sync); `502` when the host refuses or cannot be reached.
+- `POST …/end` ends the live room: a final snapshot, nobody can type, guests may read until it expires
+  (`guest_notes_end_hours` after the recording stopped ends it by itself; an ended room stays 24 h, at most the
+  room's 7 days). `404` when there is no live room. Owner or admin.
+- `POST …/new-link` stops the room and starts a new one: new id and key, the old link and its guests are gone. `404`
+  when the meeting has no guest notes. Owner or admin.
+- `DELETE` stops the room: deleted from its host at once, live or ended; returns it with `state: "stopped"` and
+  `url: null`; `404` when there is none. Owner or admin, also when `allow_guest_notes` was turned off since. Deleting
+  the meeting stops its room first (best effort).
+
+Starting, ending and stopping are in the meeting's history (`guest_notes_started|ended|stopped`) and each seals a
+record version (`EVENT_SEALS`); the records export has a `guest_notes.json` per such meeting (host, room id, who and
+when; never the link, key or tokens).
+
+Open pages, no sign-in (the key in the link is the permission), also on the team listener, with the publication
+viewer's headers and a CSP that adds `'wasm-unsafe-eval'` to `script-src` (the notes document runs as WebAssembly):
+`GET /n/{room}` is the guests' `index.html` for any room id (it reads room and key from its own address;
+`503` with a plain page when not built in) and `GET /n/{folder}/{path}` its build files (`/n/assets/…`, the `.wasm` as
+`application/wasm`).
+
+The room protocol (guest page and the owner's backend both speak it to the host): HTTP with the owner's publisher
+token to create (`PUT /live/{room}`), snapshot (`PUT …/snapshot`, `X-Room-Since` prunes the log), end
+(`POST …/end`) and delete (`DELETE`); a WebSocket `GET /live/{room}` with the room token for everyone: `join`,
+`welcome`, the snapshot, the log after `since`, then live relay (`0x01 || seq || envelope`), presence (`0x02`), `count`
+and `ended`. Everything in an envelope is sealed (AES-256-GCM, `services/guest_format.py`; the host holds only the
+room token). Two JSON kinds gained fields in phase 11 (older pages ignore them): PRESENCE `{gid, name, typing, sel?,
+gone?}` where `sel` is `{a, f}` (element ids, 64 hex, or null) or null and `gone: true` says the page is closing (gid
+"" is the owner's heartbeat, `o:<member key>` one of the owner-side editors, whose carets and typing the guests see);
+META `clock?: {part, offset, started_at}` is the recording in progress (as in `POST /api/audio/start`) and is absent
+while nothing records, so the guest page can insert time chips. A guest's PRESENCE heard in one of the meeting's rooms
+is forwarded unchanged into the others. The exact messages, close codes and limits are in the header of `publish-host/src/live.rs`.
+
 ### Transcript editing
 
 All return the updated `SessionDetail`, recompute `participants`, and emit a `session` event.
@@ -960,6 +1075,9 @@ Every action item of every summarized meeting the caller can read, newest meetin
 text, owner, done, issue_url, due, mine}]`. `mine`: the owner is the caller (their full name or
 email, or their first name when no one else on the server has it; on the desktop app,
 `local_speaker_name`); `mine=true` keeps only those. `idx` is the item's position in that session's `summary_data.action_items`.
+Items typed in a meeting's live notes (see "Action items from the notes") are listed too: `source: "notes"`, `idx`
+`-(j+1)` for the j-th of `Session.notes_items`, which no idx-based writer accepts. `item_id` is the item's id (summary
+items: `ActionItem.id`, "" on an old one without; notes items: 16 hex); `source` is `"summary"` or `"notes"`.
 `due` (`YYYY-MM-DD` or null) is a deadline named in the meeting: the summary prompt gives the model
 the meeting's date and weekday so "by Friday" becomes a date; anything that is not an ISO date is
 dropped. Open items with a deadline come first, soonest first; `due=overdue` keeps those past due,
@@ -1376,6 +1494,42 @@ returned.
 Settings: `task_linking` (`off` / `exact` / `related`, default `related`) and `task_linking_llm`
 (default off).
 
+## Sharing with people
+
+Phase 8 (services/contacts.py, shares.py, share_pull.py; docs/plans/2026-10-23-phase-8-tasks.md).
+Personal computers only: a team server answers `409`. Pairing details are in the contacts entry
+under pairing above.
+
+| Method | Path | What, and who |
+|--------|------|---------------|
+| GET | `/api/contacts` | `{me, contacts: [ContactInfo]}`, each with `pull` state. Admin / the desktop |
+| POST | `/api/contacts/codes` | A one-time contact invite `{code, kind: "contact", expires_at, urls, invite}`. Admin; needs an API token and remote access |
+| POST | `/api/contacts/pair` | `{invite}` → `ContactInfo`: redeem the other person's invite. Admin |
+| PATCH | `/api/contacts/{person}` | `{name}`: rename locally (empty = the card's name). Admin |
+| DELETE | `/api/contacts/{person}` | Remove: their CONTACT devices are revoked, their shares end. Admin |
+| POST | `/api/contacts/{person}/pull` | Pull what that contact shares now → `{state, at, error}`. Admin; `423` while locked |
+| GET | `/api/sessions/{id}/peer-shares` | Who has the meeting and which parts (`PeerShareInfo`). Its owner or an admin |
+| PUT | `/api/sessions/{id}/peer-shares/{person}` | `ShareParts` body: share with a contact or change the parts. Owner or admin; `403` on a meeting shared with you |
+| DELETE | `/api/sessions/{id}/peer-shares/{person}` | Stop sharing with that contact. Owner or admin |
+| GET | `/api/sessions/{id}/share-status` | `ShareStatus` for a meeting shared with you: `owner {person, name}`, `waiting {comments, ticks, notes}` (what has not reached the owner's computer yet) and `rejected [{kind: comment\|item_flag\|notes, reason, excerpt (first 80 characters), at}]`. `404` for any other meeting. Admin / the desktop |
+| GET | `/api/share/hello` | Who this is and the sharing protocol version. A contact's CONTACT token |
+| GET | `/api/share/changes?since=&limit=` | Signed `SharedMeeting`s changed for the calling contact, plus tombstones. A contact |
+| POST | `/api/share/card` | The contact's newer signed card (its machines changed). A contact |
+| POST | `/api/share/poke` | The contact has news: pull from it now, in the background. A contact |
+| POST | `/api/share/contributions` | `ContributionBatch`: signed comments, ticks and notes frames, checked at the hub (`413` over 200 records or 2 MB). A contact |
+
+What you do on a meeting shared with you (comments, ticks and stars on action items, notes you type)
+is signed and sent to the owner's computer by the outbox (services/share_push.py, table
+`share_outbox`; typed notes are read off the notes log past `share_pushed_seq:<id>`): a second
+after a local write, and at the start of every pull round. A transport failure leaves it waiting;
+a refusal is final and shows in `share-status`. WebSocket event `{type: "share_outbox",
+session_id, pending}` after each change. Until the owner has accepted them, pending comments and
+ticks are shown again on the pulled copy.
+
+A CONTACT token reaches only `/api/share/`; the admin token is refused there (`403`). In demo
+mode (`MNEMOSYNE_DEMO=1`) a contact "Ada Lovelace" and one meeting she shared, "Shared: Waku
+roadmap", are seeded at start (services/share_demo.py).
+
 ## Library sync
 
 A person's computers keep one library (docs/plans/2026-10-12-hashseq-collaboration.md "Phase 3
@@ -1388,9 +1542,12 @@ Each backend PULLS from its peers through the link sidecar's loopback listener f
 with the token the peer gave it. The routes a peer calls know which peer asks from that token
 (its device's endpoint); with the admin token nothing is remembered as served.
 
-- `GET /api/sync/peers` → `{self: {id, name}, peers: [{id, name, endpoint_id, created_at,
-  last_sync_at, listen}]}`; never a token. `POST /api/sync/pair` `{invite, name}` pairs with the
-  computer that showed the invite; `DELETE /api/sync/peers/{id}` stops syncing with it (what it
+- `GET /api/sync/peers` → `{self: {id, name, person: {pid, fingerprint}}, peers: [{id, name,
+  endpoint_id, created_at, last_sync_at, listen}]}`; never a token. `person` is the person key
+  (services/person.py): synced computers show the same one. `POST /api/sync/pair` `{invite, name}`
+  → `{peer, person_error}` pairs with the computer that showed the invite and shares the person
+  key (below; `person_error` says why when pairing worked and sharing the key did not: the next
+  pairing redoes it); `DELETE /api/sync/peers/{id}` stops syncing with it (what it
   synced stays).
 - `GET /api/sync/hello` → `{protocol, schema_version, app_version, id, name, seq}`. Asked first in
   every round. `protocol` is 1; a peer speaking another one is not pulled from (state `skew`,
@@ -1407,12 +1564,34 @@ with the token the peer gave it. The routes a peer calls know which peer asks fr
   notes document carries it as `notes_doc` (base64 of the canonical snapshot, folded and caught up
   with text written around it just before serving; `null` without one); the kept base leaves it
   out. Two documents are merged by union, not by the three-way text merge (see "Live notes").
+- `GET /api/sync/contacts` → `{person, has_people_data, contacts: [{person, name, my_name, card,
+  secret, created_at, updated_at, removed_at}]}`: every contact, removed ones too, complete (the shared
+  secret and card included: the caller is another of this person's computers), without the
+  runtime state. One step of every round, after hello and before the changes; merged by person,
+  the newer `updated_at` wins, a removal wins a tie (services/contacts.py `merge_rows`). An older
+  peer's `404` is skipped. If the peer's `person` differs from the puller's (computers paired
+  before the key was shared), the keys converge by the pairing rule, computed on both sides: both
+  have contacts: no merge and `warning` "<name> belongs to another person: contacts are not
+  shared" in `GET /api/sync/status` (meetings still sync); exactly one has: the other adopts its
+  key (`GET /api/sync/person-key`) and merges in the same round; neither: the higher key adopts
+  the lower. Only the adopting side acts.
+  Contacts never travel inside a `SyncSession`.
+- `GET /api/sync/person-key` → `{private}` and `PUT /api/sync/person-key` `{private}` → `{pid,
+  fingerprint}`: how pairing for library sync gives both computers one key. The computer that
+  showed the code answers the redeem with `sync.person = {pub, adopt}` (`adopt`: `mine` the
+  redeemer takes this key, `yours` this computer takes the redeemer's, `same`); the redeemer sent
+  `card.person = {pub, has_people_data}`. Neither has people data, or only the inviter: the
+  redeemer adopts the inviter's key; only the redeemer: the inviter does (`PUT`). Both have
+  contacts under different keys: the redeem answers `409` "These computers belong to different
+  people" and nothing is paired. Both routes: only a computer synced with this one (not the admin
+  token, a phone or a contact: `403`/`401`); `PUT` is `409` while this library has contacts under
+  a different key.
 - `POST /api/sync/poke` → `{scheduled}`: the calling peer has news; a pull from it follows in
   about 2 s (pokes in between make one pull). `false` when the caller is not a sync peer.
 - `POST /api/sync/now` → `{started: [peer id]}`: pull from every peer now, in the background.
 - `GET /api/sync/status` → `{self, peers: [{id, name, endpoint, listen, last_sync_at, state,
   error, done, total, received, updated, merged, deleted, waiting, clashes: [{session_id, name}],
-  app_version}]}`. `state`: `idle` (not tried since this start), `syncing`, `done`, `offline`
+  app_version, warning}]}`. `state`: `idle` (not tried since this start), `syncing`, `done`, `offline`
   (not reachable; tried again after 1, 2, 4 ... 10 minutes, at once on a poke or Sync now),
   `locked` (it answered `423`), `skew`, `error` (`error` says why). The counts are the current
   or last round's.
@@ -1499,16 +1678,20 @@ desktop (no team) the user edits, as `local_speaker_name` (or "You").
 {
   "type": "hello",
   "notes": "<64 hex: sha256(\"mnemosyne/notes/\" + session_id), the notes object's origin>",
-  "you": { "id": "<user id, \"\" on the desktop>", "name": "Ann Lee" },
+  "you": { "id": "<user id, \"\" on the desktop>", "name": "Ann Lee", "key": "m3fa91c07" },
   "read_only": false,
   "present": ["Ann Lee", "Bob Stone"],
+  "members": [{ "key": "m3fa91c07", "name": "Ann Lee", "who": "u-ann", "typing": false, "sel": null }],
   "last_edit": { "by": "Bob Stone", "at": "2026-10-22T10:15:00" },
   "snapshot": true,
   "backlog": 3
 }
 ```
 
-`present` is everyone connected, you included (distinct names). `last_edit` is `null` before
+`present` is everyone connected, you included (distinct names). `members` is the same people one per
+connection, you included: `key` (`m` + 8 hex, random at join; `you.key` is yours), `name`, `who` (the user id, else
+the name: what a caret's colour is taken from, so one person's two windows share a colour), `typing` and `sel`
+(below). `last_edit` is `null` before
 anyone typed. `"waiting_for_sync": true` (with `read_only: true`): a meeting recorded on another
 computer that has notes but whose document has not come by library sync yet; editing would make a
 second document with the same text.
@@ -1526,11 +1709,21 @@ closed normally (1000): use `POST /api/sessions/{id}/notes` and the plain text, 
   The server appends it to the log with its author and relays it to the other connections (never
   back to the sender). Refused, and the socket closed: from a read-only client **4403**; another
   first byte **4400**; over 2 MB **1009**.
-- Client JSON: `{"type": "presence", "typing": true|false}` (ignored from read-only clients),
-  `{"type": "ping"}` (answered `{"type": "pong"}`).
-- Server JSON: `{"type": "presence", "present": [names], "typing": [names]}` when someone joins,
-  leaves or starts/stops typing; `{"type": "last_edit", "by": name, "at": iso}` when someone else
+- Client JSON: `{"type": "presence", "typing"?: true|false, "sel"?: {"a", "f"} | null}` (`typing` is
+  ignored from read-only clients, `sel` is taken from everyone), `{"type": "ping"}` (answered
+  `{"type": "pong"}`). `sel` is the selection: `a` (anchor) and `f` (focus) are each null or the element id (64 hex)
+  of the character before that end of the selection; anything else is ignored whole. It is kept in memory on the
+  connection, never stored or logged.
+- Server JSON: `{"type": "presence", "present": [names], "typing": [names], "members": [...]}` when someone joins,
+  leaves or starts/stops typing (`members` as in the hello; a joiner gets the others' `sel` there);
+  `{"type": "caret", "key": member key, "sel": {"a", "f"} | null}` when someone else's selection moved (never
+  back to the mover; at most one per 100 ms for the same member, the newest position waits and goes out when the
+  window ends); `{"type": "last_edit", "by": name, "at": iso}` when someone else
   typed (at most every 15 s for the same person).
+- Guests (see docs/guest-notes.md) reach the editors as `{"type": "guests", "present": [names], "typing": [names],
+  "members": [{"key": "g:<gid>", "name", "typing", "sel"}]}` when one joins, leaves or starts/stops typing (a joiner
+  gets the last non-empty one), and `{"type": "guest_caret", "key": "g:<gid>", "sel": {"a", "f"} | null}` when only
+  a guest's selection moved. A guest is `gone` at once when their page closes, else after 30 s without presence.
 
 The notes route's writes (author `api`) arrive as ordinary frames. When the meeting had notes but
 no document, the first connection (or write) seeds one from them (author `seed`), only on the
@@ -1563,3 +1756,42 @@ text and the document catches up with it (above). Folding is blocked while a mee
 taken in. A union that cannot be made (sidecar missing or failing) leaves that meeting waiting:
 the round goes on to the following pages, but the stored sync cursor stays just before the
 earliest waiting meeting, so it is tried again next round (`waiting` in the peer's status).
+
+### Chips and action items from the notes
+
+**Chips.** A time, person or meeting reference in the notes is an ordinary markdown link whose URL starts with
+`mnemosyne:` (the editor draws it as a pill; the model is a `link` mark, nothing new in the document format):
+
+| Form | Chip |
+|---|---|
+| `[12:34](mnemosyne:t/<part>/<seconds>)` | a time in the recording: part number and whole seconds into that part |
+| `[@Ada Lovelace](mnemosyne:person/Ada%20Lovelace)` | a person (the name is percent-encoded) |
+| `[Planning, Oct 14](mnemosyne:meeting/<id>)` | a meeting (8 to 32 lowercase hex) |
+
+A link that is not exactly one of these is an ordinary link. Everything that reads `Session.notes` outside the editor
+sees text instead (services/notes_chips.py): the summary's hint, MCP and published notes get the chip's
+text (`12:34`, `@Ada Lovelace`, the title), the Obsidian note `[[Name]]` for a person when `obsidian_link_people` is on
+and `[[note|title]]` for a meeting that was exported; time chips are plain text there. The stored markdown keeps the
+URLs (full-text search indexes them like any link). Combining meetings retargets time chips to the combined timeline.
+
+**Action items from the notes** (services/notes_items.py). A task line (`- [ ]` / `- [x]`) with a person chip is an
+action item of the meeting; one without stays a checklist. `Session.notes_items` (`[NotesItem]`, an `ActionItem` plus
+`line`, `by`, `source: "notes"`) is derived again from the document at every fold: `owner` is the first person chip's
+name, `text` the line without person and time chips, `at` the first time chip's position on the meeting's joined
+timeline, `done` the tick in the notes. `id` is 16 hex taken from the line id; `follow`, `due`, `issue_url` and
+`task_id` are kept across folds. They are task objects like summary items (linking, fan-out of done/follow), listed
+in `GET /api/action-items` and `/api/tasks`, and exported to Obsidian as action items.
+
+`PATCH /api/sessions/{session_id}/notes-items/{item_id}`: body any of `{done, follow, due}` (fields left out stay;
+`due` null clears it). Returns the `TaskItem` (`source: "notes"`, `idx` negative). Text and owner change in the notes
+only. `done` and `follow` need read access (`done` is written into the notes as the tick, so editors see it);
+`due` needs write access. `400` for `PATCH …/action-items/{idx}` with a notes item's negative `idx`; `403 "Tick it in
+the notes"` on a meeting shared with you; `404` unknown meeting or item; `409` when the notes could not take the tick.
+Ticks and new items go into the meeting's history (`notes_task_added`, `task_done`, `task_reopened`).
+
+**Sidecar** (`mnemosyne-link notes doc`, notes-core/src/api.rs). Every answer carries `tasks`: the document's task
+lines in order, `[{line, done, text, links: [[start, end, url]], frame}]` (`line` the element id of the line's `\n`,
+`links` the live link marks as code-point ranges of `text`, `frame` the index of the request frame that made the
+line or its kind, else null). The op `set_kind` `{notes, snapshot, frames, line, kind: "task"|"task_done"}` makes
+that task line open or done and answers like `mark_comment` (`frames` to broadcast, `[]` when it already shows
+`kind`; an unknown, deleted or non-task line is an error). The backend uses it for a tick made outside the editor.

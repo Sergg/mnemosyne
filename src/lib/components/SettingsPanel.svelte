@@ -8,6 +8,7 @@
 	import PhoneLink from './PhoneLink.svelte';
 	import RemoteAccessHome from './RemoteAccessHome.svelte';
 	import SyncSettings from './SyncSettings.svelte';
+	import ContactsSettings from './ContactsSettings.svelte';
 	import RemoteConnect from './RemoteConnect.svelte';
 	import StorageSettings from './StorageSettings.svelte';
 	import BackupSettings from './BackupSettings.svelte';
@@ -26,6 +27,8 @@
 	import MyPreferences from './MyPreferences.svelte';
 	import LocalModelCard from './LocalModelCard.svelte';
 	import RecordsSettings from './RecordsSettings.svelte';
+	import PublicationsList from './PublicationsList.svelte';
+	import { publishingState } from '$lib/stores/publishing.svelte.js';
 	import type { DesktopCalendar, IndexStatus, ProviderModels, SettingsResponse, SettingsUpdate, SpeakerProfile, SystemInfo } from '$lib/types/index.js';
 
 	// a team server: settings belong to its admins (members and reviewers only read them).
@@ -55,7 +58,8 @@
 		| 'jira_api_token'
 		| 'hubspot_token'
 		| 'slack_webhook_url'
-		| 'matrix_access_token';
+		| 'matrix_access_token'
+		| 'publish_host_token';
 	const SECRET_KEYS: SecretKey[] = [
 		'hf_token',
 		'openai_api_key',
@@ -68,7 +72,8 @@
 		'jira_api_token',
 		'hubspot_token',
 		'slack_webhook_url',
-		'matrix_access_token'
+		'matrix_access_token',
+		'publish_host_token'
 	];
 	const emptySecrets = (): Record<SecretKey, string> => ({
 		hf_token: '',
@@ -82,7 +87,8 @@
 		jira_api_token: '',
 		hubspot_token: '',
 		slack_webhook_url: '',
-		matrix_access_token: ''
+		matrix_access_token: '',
+		publish_host_token: ''
 	});
 	let connUrl = $state(connectionState.url);
 	let connToken = $state(connectionState.token);
@@ -148,6 +154,14 @@
 				copilot_interval_seconds: v.copilot_interval_seconds,
 				whisper_model_size: v.whisper_model_size,
 				whisper_compute_type: v.whisper_compute_type,
+				publish_host: v.publish_host,
+				publish_default_expiry_days: v.publish_default_expiry_days,
+				allow_publishing: v.allow_publishing,
+				allow_guest_notes: v.allow_guest_notes,
+				guest_host: v.guest_host,
+				guest_transport: v.guest_transport,
+				guest_page_url: v.guest_page_url,
+				guest_notes_end_hours: v.guest_notes_end_hours,
 				whisper_batch_size: v.whisper_batch_size,
 				parakeet_model: v.parakeet_model,
 				parakeet_quantization: v.parakeet_quantization,
@@ -252,6 +266,7 @@
 			loadAutoRecordSettings();
 			calendarState.start(); // the calendar may have been turned on, off or changed
 			void refreshMe(); // supervision on or off shows or hides the Review view
+			void publishingState.loadSettings(); // publish host, default expiry, members may publish
 			secrets = emptySecrets();
 			providers = await listModels();
 			toastState.success('Settings saved');
@@ -1325,6 +1340,75 @@
 				</div>
 			</section>
 
+			<!-- Publishing a meeting (backend services/publishing.py) -->
+			<section aria-label="Publishing">
+				<h3 class="text-lg font-semibold text-gray-200 mb-1">Publishing</h3>
+				<p class="text-xs text-gray-500 mb-3">
+					A published meeting is a chosen part of it, encrypted, that others open with a link (from this computer or a publish
+					host) or as one file. The key is in the link: a host only ever stores encrypted data.
+				</p>
+				<div class="grid grid-cols-2 gap-3">
+					<label class="col-span-2">
+						<span class={labelClass}>Publish host (blank: none, links are served by this computer)</span>
+						<input type="url" bind:value={form.publish_host} disabled={locked('publish_host')} placeholder="https://pub.example.org" class={inputClass} />
+					</label>
+					<label class="col-span-2">
+						<span class={labelClass}>Upload token{#if settings.secrets_set.publish_host_token}<span class="text-green-500 ml-1">set</span>{/if}</span>
+						<div class="flex gap-2">
+							<input type="password" bind:value={secrets.publish_host_token} disabled={locked('publish_host_token')} placeholder={settings.secrets_set.publish_host_token ? '•••••••• (leave blank to keep)' : 'only if the host asks for one'} class={inputClass} />
+							{#if settings.secrets_set.publish_host_token && !locked('publish_host_token')}
+								<button onclick={() => clearSecret('publish_host_token')} class="text-xs text-gray-500 hover:text-red-400">Clear</button>
+							{/if}
+						</div>
+					</label>
+					<label>
+						<span class={labelClass}>New publications expire after</span>
+						<select bind:value={form.publish_default_expiry_days} disabled={locked('publish_default_expiry_days')} class={inputClass}>
+							{#each [...new Set([30, 90, 365, settings.values.publish_default_expiry_days])].sort((a, b) => a - b) as d (d)}
+								<option value={d}>{d === 365 ? '1 year' : `${d} days`}</option>
+							{/each}
+						</select>
+					</label>
+					<label class="col-span-2">
+						<span class={labelClass}>How guests reach the notes</span>
+						<select bind:value={form.guest_transport} disabled={locked('guest_transport')} class={inputClass}>
+							<option value="auto">Automatic (recommended)</option>
+							<option value="iroh">Straight to this computer (iroh)</option>
+							<option value="tunnel">A tunnel to this computer</option>
+							<option value="host">A publish host</option>
+						</select>
+						<span class="mt-1 block text-xs text-gray-500">Automatic connects guests straight to this computer, through a tunnel if that fails, or through the publish host.</span>
+					</label>
+					<label class="col-span-2">
+						<span class={labelClass}>Guest page address</span>
+						<input type="url" bind:value={form.guest_page_url} disabled={locked('guest_page_url')} placeholder="Blank: https://corpetty.github.io/mnemosyne/n/" class={inputClass} />
+						<span class="mt-1 block text-xs text-gray-500">Where the guest page is loaded from. It holds no notes: they arrive encrypted.</span>
+					</label>
+					<label class="col-span-2">
+						<span class={labelClass}>Guest notes host</span>
+						<input type="url" bind:value={form.guest_host} disabled={locked('guest_host')} placeholder="Blank: the publish host above" class={inputClass} />
+						<span class="mt-1 block text-xs text-gray-500">Where guests' notes are relayed, encrypted. Blank uses the publish host.</span>
+					</label>
+					<label>
+						<span class={labelClass}>End guest notes after a recording stops (hours)</span>
+						<input type="number" min="1" step="1" bind:value={form.guest_notes_end_hours} disabled={locked('guest_notes_end_hours')} class={inputClass} />
+					</label>
+					{#if teamAdmin}
+						<label class="flex items-center gap-2 self-end pb-1.5">
+							<input type="checkbox" bind:checked={form.allow_guest_notes} disabled={locked('allow_guest_notes')} class="rounded border-gray-600 bg-gray-800" />
+							<span class="text-sm text-gray-300">Allow guest notes</span>
+						</label>
+					{/if}
+					{#if teamAdmin}
+						<label class="flex items-center gap-2 self-end pb-1.5">
+							<input type="checkbox" bind:checked={form.allow_publishing} disabled={locked('allow_publishing')} class="rounded border-gray-600 bg-gray-800" />
+							<span class="text-sm text-gray-300">Allow members to publish</span>
+						</label>
+					{/if}
+					<div class="col-span-2"><PublicationsList /></div>
+				</div>
+			</section>
+
 			<div class="flex items-center gap-3">
 				<button
 					onclick={save}
@@ -1370,6 +1454,7 @@
 				{/if}
 				{#if !readOnly}<RemoteAccessHome enabled={settings.values.remote_access} relays={settings.values.remote_relays} tokenSet={settings.secrets_set.api_token} />{/if}
 				{#if !readOnly}<SyncSettings enabled={settings.values.remote_access} tokenSet={settings.secrets_set.api_token} />{/if}
+				{#if !readOnly && !connectionState.me?.team_mode}<ContactsSettings enabled={settings.values.remote_access} tokenSet={settings.secrets_set.api_token} />{/if}
 				<label class="block max-w-md mt-3">
 					<span class={labelClass}>Phone address</span>
 					<input type="text" bind:value={form.phone_url} disabled={locked('phone_url')} placeholder="blank: this computer's network address" class={inputClass} />
