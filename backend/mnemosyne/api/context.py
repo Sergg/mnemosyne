@@ -19,9 +19,10 @@ from ..config import Settings
 from ..events import EventBus
 from ..jobs import JobManager
 from ..search.index import VectorIndex
+from ..services import ours
 from ..services.awake import KeepAwake
 from ..services.calendar_service import CalendarService, calendar_source
-from ..services.link import LinkService, RoomsLink, parse_relays
+from ..services.link import LinkService, RoomsLink
 from ..services.meeting_types import available_types
 from ..services.model_service import ModelService
 from ..services.pairing import PairingService
@@ -308,7 +309,7 @@ class AppContext:
         return self.jobs.submit("supervision_scan", run)
 
     async def apply_remote_access(self) -> None:
-        relays = parse_relays(self.settings.remote_relays)
+        relays = ours.relays(self.settings)
         if self.link.active and (not self.settings.remote_access or relays != self.link.relays):
             await self.link.stop()
         self.link.relays = relays
@@ -321,7 +322,7 @@ class AppContext:
         keeps the relays it started with."""
         link = self.rooms_link
         if not link.active or link._task.done():
-            link.relays = parse_relays(self.settings.remote_relays)
+            link.relays = ours.relays(self.settings)
             link.start()
         await link.wait_ready()
         return link
@@ -583,12 +584,37 @@ class AppContext:
         except Exception:
             logger.warning("Task links: reconcile failed", exc_info=True)
 
+    def echo_denoise(self):
+        """The noise suppressor the echo canceller should run with: None when it is off, or
+        its plugin is not downloaded (turning it on downloads it) or cannot run here."""
+        from ..audio import noise_suppression as ns
+
+        if not self.settings.noise_suppression or not ns.supported()[0]:
+            return None
+        plugin = ns.plugin_path(self.settings.models_dir)
+        return ns.Denoise(plugin, self.settings.noise_suppression_db) if plugin else None
+
+    def recording_targets(self) -> dict[str, str]:
+        """Nodes our recordings take in place of the chosen device: the noise-suppressed mic is
+        recorded from before DeepFilterNet unless `noise_suppression_record` is on."""
+        from ..audio import noise_suppression as ns
+        from ..audio.echo_cancel import SOURCE_NODE
+
+        if not (self.echo.active and self.echo.raw_source):
+            return {}
+        # The denoised audio only while DeepFilterNet runs: after a crash it is a copy of the
+        # internal source, which survives the next one.
+        if self.settings.noise_suppression_record and not self.echo.denoise_error:
+            return {}
+        return {SOURCE_NODE: ns.RAW_SOURCE_NODE}
+
     async def _start_echo(self) -> None:
+        denoise = self.echo_denoise()
         try:
-            status = await self.echo.start(self.settings.echo_cancel_mic or None)
+            status = await self.echo.start(self.settings.echo_cancel_mic or None, denoise)
         except ValueError as e:  # a bad saved mic: fall back to the default source
             logger.warning("%s", e)
-            status = await self.echo.start()
+            status = await self.echo.start(None, denoise)
         if not status.active:
             logger.warning("Echo cancellation not started: %s", status.reason)
 

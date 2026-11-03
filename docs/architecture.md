@@ -263,6 +263,18 @@ a virtual sink. The module's virtual source shows up in the device list flagged 
 the UI selects it in place of raw mics when the user turns it on. Because the module belongs to our
 child process, stopping the backend removes it; the `echo_cancel` setting re-enables it on start.
 
+With `noise_suppression` a second `pw-cli` child loads `libpipewire-module-filter-chain` running
+DeepFilterNet's LADSPA plugin (`audio/noise_suppression.py`, downloaded once into `models_dir`):
+mic -> WebRTC AEC (mono, WebRTC's own noise suppression off, source `mnemosyne_aec_raw`) ->
+DeepFilterNet -> `mnemosyne_aec_source`. Its capture side is passive, so PipeWire suspends the chain
+while nobody records from the source. Frames it hears only noise in come out as digital silence.
+The plugin aborts its process when it falls a second behind; in its own child that never touches
+the canceller or a recording of `mnemosyne_aec_raw`, and a plain copy (filter-chain's builtin
+`copy`) takes `mnemosyne_aec_source` over (`EchoCancelManager._watch`).
+It is for other apps (calls): our own recordings of the source take `mnemosyne_aec_raw` instead
+(`AppContext.recording_targets`, `start_recording(targets=)`) unless `noise_suppression_record` is
+on, because denoising raised transcription errors on AMI (docs/plans/2026-10-27-noise-suppression.md).
+
 ### Server mode
 
 The frontend keeps its backend URL and token in `localStorage` (`stores/connection.svelte.ts`) and
@@ -440,8 +452,24 @@ Storage and serving:
 - The viewer (`viewer/`) is its own Vite entry (Svelte 5, Tailwind, no SvelteKit, no wasm) built by
   `pnpm build:viewer` into `backend/mnemosyne/api/static/viewer/` (`index.html`, `assets/`,
   `single.html`), committed and rebuilt in CI, which fails when the output differs.
-- Where a link points: a host link uses `publish_host`; a "this computer" link uses the team
+- Where a link points: a host link uses `publish_host`, else our host (services/ours.py); a "this computer" link uses the team
   listener, else `phone_url` (`local_reach`); with neither, only 127.0.0.1 can open it.
+
+### Our servers
+
+`services/ours.py` is the one place that answers "which relay, which host": `relays()` = `remote_relays`, else
+`relay.petty.services`, else none (never n0's); `publish_host()` / `guest_host()` = the setting, else
+`notes.petty.services`, else "". `use_our_servers` (None = automatic) is on unless a team server or cloud
+models off; an explicit value wins and `GET /api/settings` shows the effective one. They run from
+`deploy/ours/` (compose on two addresses, Caddy with Let's Encrypt, the privacy notice at `/privacy`,
+`update.sh` on an hourly systemd timer for each release's guest page and viewer, logs kept ~7 days, Prometheus
+counts on loopback: relay 9090, publish-host 9091 via `--metrics-listen`). publish-host has
+`--write-bytes-per-day` (200 MiB per client, rolling 24 h; 429 `write_budget`, rooms send an error then close
+4429). The link sidecar takes `--no-relay` (`rooms`: relay_kind "none", rooms refused; `home`: keeps mDNS),
+`home --no-lan` (isolated) and `relay-check --relay <url>` (`MNEMOSYNE_RELAY_CA` for a private CA). Guest page
+CSPs (backend, publish-host, GitHub Pages) list our relay next to n0's. CI: job "Our relay and host
+(deploy/ours)" runs `deploy/ours/test/smoke.sh` against a test CA; `.github/workflows/ours-health.yml` probes
+the real names.
 
 ### Live shared notes
 
@@ -563,7 +591,7 @@ https://<host>/n/<room>#<key>                                      /live/{room} 
   end, New link and stop write history lines and seal records (`EVENT_SEALS`). Auto-end runs
   `guest_notes_end_hours` after `recording_stopped`, is cleared when a new part starts and never
   fires while recording. Deleting a meeting deletes its room. The host comes from `guest_host`,
-  else `publish_host`, else `OUR_GUEST_HOST` (empty until our host runs); none gives 409. Team
+  else `publish_host`, else our host `notes.petty.services` (services/ours.py, while `use_our_servers` is on); none gives 409. The upload token goes only to the configured publish host, never to ours. Team
   servers need `allow_guest_notes`.
 
 **Phase 10: no host to run.** Guest notes work without a publish host (use and limits in

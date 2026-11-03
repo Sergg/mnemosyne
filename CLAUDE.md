@@ -193,6 +193,10 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
   `pgre[p]` bracket trick or `fuser -k <port>/tcp`. A `uv run uvicorn` child survives
   killing the `uv` wrapper; kill by port.
 
+- Tests never reach *.petty.services: conftest `no_our_servers` and `use_our_servers=False` in the settings fixture; the e2e
+  backend (tests-e2e/start-backend.sh) sets it false. `deploy/ours/test/smoke.sh` edits /etc/hosts and refuses outside CI.
+  The ours-health workflow's schedule stays commented out until the servers run (manual only until then).
+
 - Live notes need the link sidecar. services/link.py prefers `link/target/release` over `debug`, so
   a stale local release build silently turns live notes off (hello `unavailable`): rebuild it or set
   `MNEMOSYNE_LINK_BIN`. The e2e CI job builds link, so the sidecar specs run there.
@@ -301,11 +305,11 @@ docs/remote-access.md. Remote access over iroh (link/ crate, `mnemosyne-link hom
 services/link.py while `remote_access` is on): paired computers ("desktop" devices, bound to their
 iroh endpoint id) tunnel TCP to 127.0.0.1:8008; tested with `cargo test` in link/. Desktop app
 integration: src-tauri/src/remote.rs + Settings (RemoteConnect, RemoteAccessHome). Relays:
-`remote_relays` (blank = n0's public ones); computers follow the relays in home's ticket; self-host
+`remote_relays` (blank = ours, relay.petty.services, see "Our servers"; never n0's); computers follow the relays in home's ticket; self-host
 with deploy/relay/ (open iroh-relay, rate limits, no gating service). Local first (Corey's rule
 for defaults): home announces itself by mDNS (iroh-mdns-address-lookup), computers only listen,
 so same-network connections never touch a relay. Fallback relays: ours by default once they exist
-(Corey, 2026-09-28), not n0's; until then blank `remote_relays` means n0's. Logos Messaging is later.
+(Corey, 2026-09-28), not n0's: done, see "Our servers". Logos Messaging is later.
 
 Nemotron diarizer (2026-09-25, transcription/diarizers/nemotron.py): NVIDIA Nemotron-3-Diarization
 (Streaming Sortformer, max 8 speakers) via NeMo, default on NVIDIA through `diarizer = "auto"`;
@@ -507,6 +511,13 @@ with only the chosen parts (services/shares.py), `/api/share/changes` and signed
 library sync, task links, Ask, semantic search, the digest or Obsidian (`shared_in_*`). Demo mode
 seeds Ada Lovelace's shared meeting only through `POST /api/demo/share` (the e2e spec calls it).
 
+Noise suppression (released as 0.26.0, docs/plans/2026-10-27-noise-suppression.md): DeepFilterNet's LADSPA
+plugin (pinned download) in a PipeWire filter-chain behind the echo canceller, in a pw-cli of its own
+(audio/noise_suppression.py; `noise_suppression`, `noise_suppression_db`). Our recordings take the
+pre-DeepFilterNet source `mnemosyne_aec_raw` unless `noise_suppression_record` (it raised Phonon's WER
+in noise on AMI); other apps get the clean mic. The plugin panics after 1 s of underruns, killing
+its pw-cli (never the canceller's, so recordings carry on): `EchoCancelManager._watch` loads a plain
+copy as the visible source. Keep the two processes apart.
 
 Guest notes (released as 0.24.0, phase 9; design in the hashseq plan, build order and corrections in
 docs/plans/2026-10-24-phase-9-tasks.md, use in docs/guest-notes.md): a link `https://<host>/n/<room>#<key>` for the
@@ -560,6 +571,19 @@ derived at every fold-result site from the sidecar's new `tasks` list; they are 
 `PATCH /api/sessions/{id}/notes-items/{item_id}`, and a tick goes into the document with the sidecar's `set_kind`
 (notes-core/src/api.rs). Tests: backend test_notes_items / test_notes_chips, Vitest chips/slash/carets/placement,
 tests-e2e/notes-items.spec.ts; harness at /dev/notes-editor.
+
+Our servers (released as 0.27.0; design and decisions in docs/plans/2026-10-26-our-relays-and-host.md, use in
+docs/remote-access.md, guest-notes.md, publishing.md): Mnemosyne runs its own iroh relay `relay.petty.services` and
+publish host `notes.petty.services` (petty.services, Corey's consultancy), from deploy/ours/ (compose on two
+addresses, Caddy + Let's Encrypt, privacy notice at /privacy, update.sh + hourly timer pulling each release's guest page
+and viewer, no client addresses in logs, Prometheus counts on loopback). n0's relays are no longer a default anywhere.
+services/ours.py resolves relays and hosts: blank `remote_relays` = ours, blank `publish_host`/`guest_host` = ours, else
+none; `use_our_servers` (None = automatic: on, except team servers and `cloud_models` off; an explicit value wins; GET
+shows the effective one). Guest notes: iroh through our relay plus the mirror on our host by default; `relay_kind`
+"ours"/"custom"/"none"; the upload token never goes to our host; publishing preselects "Mnemosyne's server". publish-host
+gained `--write-bytes-per-day` (200 MiB per client, 429 `write_budget`, rooms close 4429) and `--metrics-listen`. link:
+`rooms --no-relay`, `home --no-relay` (mDNS stays), `home --no-lan`, `relay-check --relay` (`MNEMOSYNE_RELAY_CA`). No
+migration: computers paired under n0 are paired again. CI: job "Our relay and host (deploy/ours)" and ours-health.yml.
 
 Candidates next: offline installer (pre-seeded uv cache). Flathub is on hold (Corey, 2026-09-29).
 

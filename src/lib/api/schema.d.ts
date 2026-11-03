@@ -264,7 +264,9 @@ export interface paths {
         put?: never;
         /**
          * Echo Cancel Set
-         * @description Load or unload the PipeWire echo-cancel module and remember the choice.
+         * @description Load or unload the PipeWire echo-cancel module (with DeepFilterNet behind it when noise
+         *     suppression is on) and remember the choices. Turning noise suppression on downloads the
+         *     plugin first if it is not there.
          */
         post: operations["echo_cancel_set_api_audio_echo_cancel_post"];
         delete?: never;
@@ -5115,6 +5117,12 @@ export interface components {
             enabled: boolean;
             /** Mic */
             mic?: string | null;
+            /** Noise Suppression */
+            noise_suppression?: boolean | null;
+            /** Noise Suppression Db */
+            noise_suppression_db?: number | null;
+            /** Noise Suppression Record */
+            noise_suppression_record?: boolean | null;
         };
         /** EchoCancelResponse */
         EchoCancelResponse: {
@@ -5126,6 +5134,7 @@ export interface components {
             mic: string | null;
             /** Mic Description */
             mic_description: string | null;
+            noise_suppression: components["schemas"]["NoiseSuppressionStatus"];
             /** Pending Mic */
             pending_mic: string | null;
             /** Reason */
@@ -5784,6 +5793,27 @@ export interface components {
              */
             role: string;
         };
+        /** NoiseSuppressionStatus */
+        NoiseSuppressionStatus: {
+            /** Active */
+            active: boolean;
+            /** Db */
+            db: number;
+            /** Download Mb */
+            download_mb: number;
+            /** Downloaded */
+            downloaded: boolean;
+            /** Enabled */
+            enabled: boolean;
+            /** Pending */
+            pending: boolean;
+            /** Reason */
+            reason: string | null;
+            /** Record */
+            record: boolean;
+            /** Supported */
+            supported: boolean;
+        };
         /** NotesCreate */
         NotesCreate: {
             /**
@@ -6327,6 +6357,10 @@ export interface components {
              * @default true
              */
             hide_identifiers: boolean;
+            /** Host Is Ours */
+            host_is_ours: boolean;
+            /** Host Url */
+            host_url: string;
             /**
              * Local Reach
              * @enum {string}
@@ -7292,6 +7326,12 @@ export interface components {
             mic_speech_gate?: boolean | null;
             /** Min Speakers */
             min_speakers?: number | null;
+            /** Noise Suppression */
+            noise_suppression?: boolean | null;
+            /** Noise Suppression Db */
+            noise_suppression_db?: number | null;
+            /** Noise Suppression Record */
+            noise_suppression_record?: boolean | null;
             /** Obsidian Auto Export */
             obsidian_auto_export?: boolean | null;
             /** Obsidian Daily Folder */
@@ -7406,6 +7446,8 @@ export interface components {
             transcriber?: string | null;
             /** Unload Models After Minutes */
             unload_models_after_minutes?: number | null;
+            /** Use Our Servers */
+            use_our_servers?: boolean | null;
             /** Vllm Url */
             vllm_url?: string | null;
             /** Web Dir */
@@ -7592,6 +7634,12 @@ export interface components {
             mic_speech_gate: boolean;
             /** Min Speakers */
             min_speakers: number | null;
+            /** Noise Suppression */
+            noise_suppression: boolean;
+            /** Noise Suppression Db */
+            noise_suppression_db: number;
+            /** Noise Suppression Record */
+            noise_suppression_record: boolean;
             /** Obsidian Auto Export */
             obsidian_auto_export: boolean;
             /** Obsidian Daily Folder */
@@ -7712,6 +7760,8 @@ export interface components {
             transcriber: string;
             /** Unload Models After Minutes */
             unload_models_after_minutes: number;
+            /** Use Our Servers */
+            use_our_servers: boolean;
             /** Vllm Url */
             vllm_url: string;
             /** Web Dir */
