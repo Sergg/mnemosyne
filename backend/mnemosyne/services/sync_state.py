@@ -25,6 +25,7 @@ from ..models.sync_session import (
     SyncBookmark,
     SyncComment,
     SyncEvent,
+    SyncMedia,
     SyncPeerShare,
     SyncPublication,
     SyncSession,
@@ -35,6 +36,11 @@ from ..storage.sqlite import SessionRepository
 
 # Two meetings with the same id are one meeting when they started this close together.
 CLASH_SECONDS = 2.0
+
+
+def _b64(raw) -> str:
+    """A BLOB column as base64 text, "" for NULL."""
+    return base64.b64encode(bytes(raw)).decode("ascii") if raw else ""
 
 
 def export_session(repo: SessionRepository, session_id: str, device_id: str) -> SyncSession | None:
@@ -148,6 +154,8 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
                 published_digest=x["published_digest"],
                 published_by=x["published_by"],
                 origin=x["origin"] or device_id,
+                sign_key=_b64(x["sign_key"]),
+                box_key=_b64(x["box_key"]),
             )
             for x in rows["publications"]
         ],
@@ -161,6 +169,18 @@ def export_session(repo: SessionRepository, session_id: str, device_id: str) -> 
                 revoked_at=x["revoked_at"],
             )
             for x in rows["peer_shares"]
+        ],
+        media=[
+            SyncMedia(
+                sha256=x["sha256"],
+                ext=x["ext"],
+                width=x["width"],
+                height=x["height"],
+                size=x["size"],
+                created_at=x["created_at"],
+                by=x["by"],
+            )
+            for x in repo.media_rows(session_id)
         ],
         speaker_embeddings={x["label"]: json.loads(x["embedding"]) for x in rows["embeddings"]},
         assets=[

@@ -67,10 +67,14 @@ class AppContext:
     _idle_task: asyncio.Task | None = None
     _awake_task: asyncio.Task | None = None
     _vault_task: asyncio.Task | None = None
+    _media_task: asyncio.Task | None = None
     # Ticks read back from the Obsidian vault (services/vault_sync.py): seconds between passes
     # (0: none; tests drive sync_vault directly) and each note's mtime at the last pass.
     vault_sync_interval: float = 300.0
     vault_seen: dict = field(default_factory=dict)
+    # Unused images of the notes are swept at startup and then this often (seconds; 0: never,
+    # tests call services/notes_media.py `sweep` directly).
+    media_sweep_interval: float = 24 * 3600.0
     _intervals: tuple[float, float] = (6 * 3600, 900)
     capture_apps_now: list = field(default_factory=list)  # last poll, for /api/audio/apps
     live: dict = field(default_factory=dict)  # session id -> running LiveTranscriber
@@ -82,6 +86,13 @@ class AppContext:
     notes_hub: Any = None
     # Guest notes (services/guest_notes.py): the bridges of live rooms and a lock per meeting.
     guest_bridges: Any = None
+    # The notes' Summary section follows every write of a summary (services/notes_summary.py):
+    # this many seconds after the last one, in a thread. The pending timers by meeting, the
+    # running syncs, and the event loop (known from startup; without it nothing is scheduled).
+    summary_notes_delay: float = 1.0
+    _summary_notes: dict = field(default_factory=dict)
+    _summary_syncs: set = field(default_factory=set)
+    _loop: Any = None
     # A team server's per-person calendars (calendar_for), by ICS link.
     person_calendars: dict = field(default_factory=dict)
     team_host: TeamHost = field(default_factory=lambda: TeamHost())
@@ -102,6 +113,12 @@ class AppContext:
     )
     share_pull: Any = None  # services/share_pull.py SharePuller: meetings contacts share with us
     share_push: Any = None  # services/share_push.py SharePusher: what I did on them, sent back
+    # services/live_publications.py Watcher: republishes followed publications when their
+    # meeting changes. Its loop runs only while `live_watcher.interval` > 0 (tests set 0 and tick).
+    live_watcher: Any = None
+    # services/live_publications.py Bridges: each live hosted publication's room on its host
+    # (VERSION, THREADS, META). Inert while `live_bridges.enabled` is off (tests, conftest).
+    live_bridges: Any = None
     person: Any = None  # services/person.py PersonKeys: this person's signing key
 
     def __post_init__(self) -> None:
@@ -109,7 +126,54 @@ class AppContext:
         self.sessions.type_source = lambda: available_types(self.settings)
         self.sessions.is_recording = lambda sid: sid in self.active_recordings
         self.repo.on_new_session = self._new_session
+        self.repo.after_summary = self._summary_changed
         self.sessions.before_delete = self._forget_publications
+        # Edits in the notes' Summary section flow back into the summary from the first fold.
+        from ..services import notes_summary
+
+        notes_summary.register()
+
+    def _summary_changed(self, session_id: str) -> None:
+        """The repository wrote a meeting's summary (from any thread): its notes' Summary
+        section is synced `summary_notes_delay` s after the last such write. Never blocks."""
+        loop = self._loop
+        if loop is None or loop.is_closed() or not self.settings.summary_in_notes:
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._schedule_summary_notes(session_id)
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_summary_notes, session_id)
+        except RuntimeError:  # closed meanwhile
+            pass
+
+    def _schedule_summary_notes(self, session_id: str) -> None:
+        self.cancel_summary_notes(session_id)
+        if self._loop is None:  # shut down meanwhile
+            return
+        self._summary_notes[session_id] = self._loop.call_later(
+            self.summary_notes_delay, self._run_summary_notes, session_id
+        )
+
+    def cancel_summary_notes(self, session_id: str) -> None:
+        """Forget a pending sync (on the loop): the summarize job runs its own."""
+        handle = self._summary_notes.pop(session_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _run_summary_notes(self, session_id: str) -> None:
+        from ..services import notes_summary
+
+        self._summary_notes.pop(session_id, None)
+        task = asyncio.ensure_future(
+            asyncio.to_thread(notes_summary.sync, self, session_id, create=False)
+        )
+        self._summary_syncs.add(task)
+        task.add_done_callback(self._summary_syncs.discard)
 
     def _forget_publications(self, session_id: str):
         from ..services import guest_notes
@@ -254,6 +318,10 @@ class AppContext:
         from ..services.share_push import SharePusher
 
         ctx.share_push = SharePusher(ctx)
+        from ..services.live_publications import Bridges, Watcher
+
+        ctx.live_watcher = Watcher(ctx)
+        ctx.live_bridges = Bridges(ctx)
 
         # The sidecar's listeners are new each start: dial the sync peers and the contacts'
         # machines again, then pull.
@@ -437,6 +505,16 @@ class AppContext:
             except Exception:
                 logger.exception("Digest schedule check failed")
 
+    async def _media_loop(self, interval_seconds: float) -> None:
+        from ..services.notes_media import sweep
+
+        while True:
+            try:
+                await asyncio.to_thread(sweep, self)
+            except Exception:
+                logger.exception("Sweeping unused notes images failed")
+            await asyncio.sleep(interval_seconds)
+
     async def _idle_loop(self, interval_seconds: float) -> None:
         while True:
             await asyncio.sleep(interval_seconds)
@@ -503,6 +581,7 @@ class AppContext:
 
         self.startup_problems[:0] = STARTUP_PROBLEMS
         self._intervals = (retention_interval, digest_interval)
+        self._loop = asyncio.get_running_loop()
         await self._try("Cleaning temporary copies", clean_scratch)
         # Also while locked: a paired computer can unlock.
         await self._try("Remote access", self.apply_remote_access)
@@ -558,6 +637,8 @@ class AppContext:
             from ..services.vault_sync import sync_loop
 
             self._vault_task = asyncio.create_task(sync_loop(self, self.vault_sync_interval))
+        if self.media_sweep_interval > 0:
+            self._media_task = asyncio.create_task(self._media_loop(self.media_sweep_interval))
         # Linked tasks that disagree (a tick merged in elsewhere) settle on their head.
         await self._try("Task links", self._reconcile_tasks)
         # Library sync: claim meetings from before it, then pull from the peers and watch.
@@ -569,6 +650,10 @@ class AppContext:
         from ..services import guest_notes
 
         await self._try("Guest notes", lambda: guest_notes.resume(self))
+        # Followed publications: a new version by itself when their meeting changes.
+        await self._try("Live publications", self.live_watcher.start)
+        # Their rooms: a bridge for each live hosted publication recorded here.
+        await self._try("Live publication rooms", self.live_bridges.resume)
 
     async def _reconcile_tasks(self) -> None:
         from ..services import task_links, task_migration
@@ -653,6 +738,10 @@ class AppContext:
             await self.share_push.stop()
         if self.share_pull is not None:
             await self.share_pull.stop()
+        if self.live_watcher is not None:  # before the jobs: it submits publish jobs
+            await self.live_watcher.stop()
+        if self.live_bridges is not None:  # the rooms stay on their hosts
+            await self.live_bridges.shutdown()
         await self.link.stop()
         await self.rooms_link.stop()
         await self.index.stop()
@@ -664,6 +753,7 @@ class AppContext:
             self._idle_task,
             self._awake_task,
             self._vault_task,
+            self._media_task,
         ):
             if task is not None:
                 task.cancel()
@@ -672,6 +762,11 @@ class AppContext:
         await self.models.unload()
         from ..services import guest_notes, shared_notes
 
+        self._loop = None  # nothing is scheduled any more
+        for session_id in list(self._summary_notes):
+            self.cancel_summary_notes(session_id)
+        if self._summary_syncs:  # before the database closes
+            await asyncio.gather(*self._summary_syncs, return_exceptions=True)
         await guest_notes.shutdown(self)  # before the notes hub: its bridges detach from it
         await shared_notes.shutdown(self)
         self.repo.close()

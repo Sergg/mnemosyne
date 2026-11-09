@@ -16,8 +16,9 @@ from mnemosyne.api.app import create_app
 from mnemosyne.models.publication import PublicationSelection, QuoteSpan
 from mnemosyne.models.session import ActionItem, Chapter, Session, SummaryData
 from mnemosyne.models.transcript import TranscriptSegment
-from mnemosyne.services import clips, publishing
+from mnemosyne.services import clips, notes_media, publishing
 from mnemosyne.services import publication_format as pf
+from tests.test_notes_media import jpeg, sha, value, webp
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 
@@ -403,11 +404,215 @@ def test_a_real_clip(client, ctx, tmp_path, seals):
     assert ogg.startswith(b"OggS") and clip.seconds == pytest.approx(6.3)
 
 
+# ---- images in the notes ----
+
+
+def _picture_meeting(ctx, *pictures, captions=("Whiteboard", "Bo Chen's sketch")):
+    """A meeting whose notes embed `pictures` (bytes, stored in its media store), one line each.
+    Returns (session, [plain hashes])."""
+    s = _meeting(ctx)
+    lines = []
+    for data, caption in zip(pictures, captions, strict=False):
+        info = notes_media.store(ctx, s.id, sha(data), data)
+        lines.append(
+            f"![{caption}](mnemosyne:image/{value(data, info.ext, info.width, info.height)})"
+        )
+    s.notes = "Intro\n" + "\n".join(lines) + "\nOutro\n"
+    ctx.repo.update_fields(s.id, notes=s.notes)
+    return s, [sha(p) for p in pictures]
+
+
+def test_notes_images_are_kept_or_left_out_as_selected(ctx):
+    pics = (webp(640, 480), jpeg(800, 600))
+    s, (a, b) = _picture_meeting(ctx, *pics)
+    people = ["Ana Lopez", "Bo Chen", "Cy Park"]
+
+    def notes(**kw):
+        sel = PublicationSelection(notes=True, attendees=people, **kw)
+        content, _ = publishing.build_content(ctx, s, sel)
+        return content
+
+    everything = notes()
+    assert [i["id"] for i in everything["images"]] == [a, b]
+    assert everything["images"][1] == {"id": b, "ext": "jpeg", "width": 800, "height": 600}
+    assert everything["notes"] == (
+        "Intro\n"
+        f"![Whiteboard](mnemosyne:image/{a}.webp@640x480)\n"
+        f"![Bo Chen's sketch](mnemosyne:image/{b}.jpeg@800x600)\n"
+        "Outro\n"
+    )
+    # A left-out image is its caption, never a URL; the other stays.
+    only_b = notes(images=[b])
+    assert [i["id"] for i in only_b["images"]] == [b]
+    assert "[image: Whiteboard]" in only_b["notes"] and a not in only_b["notes"]
+    # None left: no `images` key at all, so the digest is what it was before images existed.
+    none = notes(images=[])
+    assert "images" not in none and "mnemosyne:" not in none["notes"]
+    assert none["notes"].count("[image: ") == 2
+    # Without the notes there is nothing, whatever `images` says.
+    off, _ = publishing.build_content(ctx, s, PublicationSelection(images=[a]))
+    assert off["notes"] is None and "images" not in off
+    # Names and identifiers in a caption are redacted like the rest; escapes survive.
+    s.notes = f"![Bo Chen \\[v2\\] 123456789012](mnemosyne:image/{value(pics[0])})\n"
+    shown, _ = publishing.build_content(
+        ctx, s, PublicationSelection(notes=True, attendees=["Ana Lopez"])
+    )
+    assert "Bo Chen" not in shown["notes"] and "123456789012" not in shown["notes"]
+    assert shown["notes"].startswith("![Person 1 \\[v2\\] \\[account ••9012\\]](")
+    assert f"](mnemosyne:image/{value(pics[0])})" in shown["notes"]  # the URL is untouched
+    # The same image twice is one entry.
+    s.notes = f"![x](mnemosyne:image/{value(pics[0])})\n![y](mnemosyne:image/{value(pics[0])})\n"
+    twice, _ = publishing.build_content(ctx, s, PublicationSelection(notes=True, attendees=people))
+    assert [i["id"] for i in twice["images"]] == [a]
+
+
+def test_a_meeting_without_images_digests_as_before(ctx):
+    s = _meeting(ctx)
+    s.notes = "Plain [site](https://example.com) notes"
+    sel = PublicationSelection(notes=True, attendees=["Ana Lopez"])
+    content, specs = publishing.build_content(ctx, s, sel)
+    assert "images" not in content and content["notes"] == s.notes
+    manifest, _ = publishing.build_manifest(ctx, s, sel, "0" * 16, 1)
+    assert manifest.images == [] and b'"images"' not in pf.manifest_bytes(manifest)
+
+
+def test_defaults_list_the_notes_images_and_preview_shows_them(client, ctx):
+    s, (a, b) = _picture_meeting(ctx, webp(), jpeg())
+    d = client.get(f"/api/sessions/{s.id}/publication/defaults").json()
+    assert d["images"] is None
+    assert [(i["sha256"], i["caption"], i["width"], i["height"]) for i in d["notes_images"]] == [
+        (a, "Whiteboard", 640, 480),
+        (b, "Bo Chen's sketch", 800, 600),
+    ]
+    assert d["notes_images"][0]["size"] == len(webp())
+    # The defaults go back as a selection.
+    p = client.post(f"/api/sessions/{s.id}/publication/preview", json={**d, "notes": True}).json()
+    assert [(i["id"], i["mime"]) for i in p["images"]] == [(a, "image/webp"), (b, "image/jpeg")]
+    assert p["images"][0]["preview_url"] == f"/api/sessions/{s.id}/notes/media/{a}"
+    left = client.post(
+        f"/api/sessions/{s.id}/publication/preview", json={**d, "notes": True, "images": [b]}
+    ).json()
+    assert [i["id"] for i in left["images"]] == [b] and "[image: Whiteboard]" in left["notes"]
+    plain = client.post(f"/api/sessions/{s.id}/publication/preview", json={}).json()
+    assert plain["images"] == []
+
+
+def test_publishing_seals_the_images_and_reuses_them(client, ctx, seals):
+    pics = (webp(640, 480), jpeg(800, 600))
+    s, (a, b) = _picture_meeting(ctx, *pics)
+    pub = _publish(client, s.id, notes=True, attendees=["Ana Lopez", "Bo Chen"])
+    pub_id, key = _key_and_id(pub["url"])
+    m = _open(client, pub["url"])
+    assert [(i.id, i.mime, i.width, i.height, i.size, i.v) for i in m.images] == [
+        (a, "image/webp", 640, 480, len(pics[0]), 1),
+        (b, "image/jpeg", 800, 600, len(pics[1]), 1),
+    ]
+    for ref, data in zip(m.images, pics, strict=True):
+        r = client.get(f"/pub/{pub_id}/{ref.sha256}")
+        assert r.status_code == 200 and "immutable" in r.headers["cache-control"]
+        assert pf.open_image(pub_id, ref, r.content, key) == data
+        assert len(r.content) % pf.IMAGE_BLOCK == pf.NONCE_SIZE + pf.TAG_SIZE
+    assert f"mnemosyne:image/{a}.webp@640x480" in m.notes
+    stored = ctx.repo.live_publication(s.id)["clip_blobs"]
+    assert set(stored) == {f"image:{a}", f"image:{b}"} and not any(
+        pf.b64url_encode(d) in str(stored) for d in pics
+    )
+    # No plain hash or caption outside the sealed manifest: meta.json lists blob addresses only.
+    meta = json.loads((publishing.pub_dir(ctx, pub_id) / "meta.json").read_text())
+    assert sorted(meta["blobs"]) == sorted(i.sha256 for i in m.images)
+    assert [e for e in ctx.repo.events(s.id) if e["kind"] == "published"][0]["detail"][
+        "images"
+    ] == 2
+
+    # An update keeps the sealed blobs (the files are not read again), leaves one image out,
+    # and the blob nobody references any more goes.
+    first = {i.id: i for i in m.images}
+    read = []
+    real = notes_media.read
+    ctx_read = lambda app, sid, h: (read.append(h), real(app, sid, h))[1]  # noqa: E731
+    notes_media.read, saved = ctx_read, real
+    try:
+        pub2 = _publish(client, s.id, notes=True, attendees=["Ana Lopez"], images=[b])
+    finally:
+        notes_media.read = saved
+    assert read == [] and pub2["version"] == 2
+    m2 = _open(client, pub2["url"])
+    assert [i.id for i in m2.images] == [b] and m2.images[0] == first[b]
+    assert "[image: Whiteboard]" in m2.notes and a not in m2.notes
+    assert client.get(f"/pub/{pub_id}/{first[a].sha256}").status_code == 404
+    assert client.get(f"/pub/{pub_id}/{first[b].sha256}").status_code == 200
+    assert set(ctx.repo.live_publication(s.id)["clip_blobs"]) == {f"image:{b}"}
+    # Putting it back seals it again, as of this version.
+    m3 = _open(client, _publish(client, s.id, notes=True, attendees=["Ana Lopez"])["url"])
+    again = next(i for i in m3.images if i.id == a)
+    assert again.v == 3 and again.sha256 != first[a].sha256
+
+
+def test_the_publication_is_behind_when_an_image_is_taken_out_of_the_notes(client, ctx, seals):
+    s, (a, b) = _picture_meeting(ctx, webp(), jpeg())
+    pub = _publish(client, s.id, notes=True)
+    assert not pub["behind"]
+    ctx.repo.update_fields(s.id, notes="Intro only\n")
+    assert client.get(f"/api/sessions/{s.id}/publication").json()["behind"]
+    assert _open(client, _publish(client, s.id, notes=True)["url"]).images == []
+
+
+def test_an_image_that_is_not_here_is_refused_before_the_job(client, ctx, seals):
+    s, (a, b) = _picture_meeting(ctx, webp(), jpeg())
+    notes_media.remove_blob(ctx, s.id, a)
+    r = client.put(f"/api/sessions/{s.id}/publication", json={"where": "local", "notes": True})
+    assert r.status_code == 400 and "not on this computer" in r.json()["detail"]
+    # Leaving it out, or not publishing the notes, is fine.
+    ok = _publish(client, s.id, notes=True, images=[b])
+    assert [i.id for i in _open(client, ok["url"]).images] == [b]
+
+
+def test_images_and_clips_share_the_total_cap(client, ctx, seals, fake_cut, monkeypatch):
+    s, _ = _picture_meeting(ctx, webp(), jpeg())
+    s = ctx.repo.update_fields(s.id, audio_file="/nowhere/mixed.ogg")
+    # Room for one 64 KiB block of image or clip and no more: two images do not fit...
+    monkeypatch.setattr(pf, "MAX_CLIPS_TOTAL", pf.IMAGE_BLOCK)
+    r = client.put(f"/api/sessions/{s.id}/publication", json={"where": "local", "notes": True})
+    job = _wait(client, r.json()["id"])
+    assert job["status"] == "failed" and "clips and images may total at most" in job["error"]
+    # ... nor one image and one clip.
+    quotes = [{"start": 0, "end": 6, "with_clip": True}]
+    r = client.put(
+        f"/api/sessions/{s.id}/publication",
+        json={"where": "local", "notes": True, "images": [sha(webp())], "quotes": quotes},
+    )
+    job = _wait(client, r.json()["id"])
+    assert job["status"] == "failed" and "total at most" in job["error"]
+    ok = _publish(client, s.id, notes=True, images=[sha(webp())])
+    assert len(_open(client, ok["url"]).images) == 1
+
+
+def test_images_go_to_the_host_once(client, ctx, settings, seals):
+    host = FakeHost()
+    ctx.http_transport = httpx.MockTransport(host.handler)
+    settings.publish_host = "https://pub.example.org"
+    s, (a, b) = _picture_meeting(ctx, webp(), jpeg())
+    pub = _publish(client, s.id, where="host", notes=True)
+    pub_id, key = _key_and_id(pub["url"])
+    m = pf.open_manifest(pub_id, 1, host.manifest, key)
+    assert len(m.images) == 2 and set(host.blobs) == {i.sha256 for i in m.images}
+    put_blobs = [p for mth, p, _ in host.calls if mth == "PUT" and p.count("/") == 3]
+    assert len(put_blobs) == 2
+    assert host.calls[-1][2]["x-pub-blobs"].split(",") == [i.sha256 for i in m.images]
+    host.calls.clear()
+    _publish(client, s.id, where="host", notes=True, summary=False)
+    assert [(mth, p) for mth, p, _ in host.calls] == [("PUT", f"/pub/{pub_id}")]
+
+
 # ---- the publish host ----
 
 
 class FakeHost:
-    """The publish host contract (publish-host/), enough for the client."""
+    """The publish host contract (publish-host/), enough for the client. The room pointer
+    (`room`, live publications): `X-Pub-Room` on `PUT /pub/{id}` and `GET /pub/{id}`, and
+    `PUT /pub/{id}/room` (an empty body clears it); `pointer = False` plays an older host,
+    which takes "room" for a blob's sha (400 bad_sha256). No `/live/` rooms here (404):
+    tests/test_live_publications.py puts a FakeRoomHost beside it."""
 
     def __init__(self):
         self.calls = []
@@ -415,15 +620,24 @@ class FakeHost:
         self.blobs: dict[str, bytes] = {}
         self.manifest = None
         self.version = 0
+        self.room: str | None = None
+        self.pointer = True
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.calls.append((request.method, path, dict(request.headers)))
+        if not path.startswith("/pub/"):
+            return httpx.Response(404, json={"error": "not_found"})
         if request.method == "GET" and path.count("/") == 2:  # the manifest: open, like the host
             if self.manifest is None:
                 return httpx.Response(404)
             etag = '"' + hashlib.sha256(self.manifest).hexdigest() + '"'
-            return httpx.Response(200, content=self.manifest, headers={"etag": etag})
+            headers = {"etag": etag, "x-pub-version": str(self.version)}
+            if self.room:
+                headers["x-pub-room"] = self.room
+            return httpx.Response(200, content=self.manifest, headers=headers)
+        if request.method == "PUT" and path.endswith("/room") and not self.pointer:
+            return httpx.Response(400, json={"error": "bad_sha256"})
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
             return httpx.Response(401, json={"error": "unauthorized"})
@@ -433,6 +647,11 @@ class FakeHost:
         elif token != self.token:
             return httpx.Response(403, json={"error": "wrong_token"})
         parts = path.strip("/").split("/")
+        if request.method == "PUT" and len(parts) == 3 and parts[2] == "room":
+            if self.manifest is None:
+                return httpx.Response(404, json={"error": "not_found"})
+            self.room = request.content.decode().strip() or None
+            return httpx.Response(204)
         if request.method == "PUT" and len(parts) == 3:
             known = parts[2] in self.blobs
             self.blobs[parts[2]] = request.content
@@ -447,10 +666,13 @@ class FakeHost:
                 return httpx.Response(409, json={"error": "missing", "missing": missing})
             assert int(request.headers["x-pub-expires"]) <= time.time() + 365 * 86400 + 60
             self.version, self.manifest = version, request.content
+            if "x-pub-room" in request.headers:
+                self.room = request.headers["x-pub-room"] or None
             return httpx.Response(200, json={"version": version})
         if request.method == "DELETE":
             self.blobs.clear()
             self.manifest = None
+            self.room = None
             return httpx.Response(204)
         return httpx.Response(404)
 
@@ -670,3 +892,231 @@ def test_a_same_version_conflict_is_ours_only_when_the_host_holds_our_manifest(
     r = client.put(f"/api/sessions/{s.id}/publication", json={"where": "host"})
     job = _wait(client, r.json()["id"])
     assert job["status"] == "failed" and "at the same time" in job["error"]
+
+
+def test_publishing_the_notes_leaves_the_backends_sections_out(ctx):
+    from tests.test_notes_items import WITH_SUMMARY, store_doc
+
+    s = _meeting(ctx)
+    store_doc(ctx, s.id, WITH_SUMMARY)
+    s.notes = WITH_SUMMARY
+    manifest = publishing.build_manifest(
+        ctx, s, PublicationSelection(notes=True), "0123456789abcdef", 1
+    )[0]
+    assert manifest.notes.strip() == "My own note"
+    assert "summary line" not in manifest.notes
+
+
+# ---- live publications: follow, comments and the owner keys (task 4) ----
+
+
+class _Job:
+    """The part of a JobContext `publishing.publish` uses, for calling it without a route."""
+
+    def update(self, message=None, progress=None):
+        pass
+
+
+def _auto(ctx, sid, sel, who=None):
+    """Run the publish job's body with `auto=True` (what the watcher does), as `who`."""
+    return asyncio_run(publishing.publish(ctx, sid, sel, _Job(), auto=True), who)
+
+
+def asyncio_run(coro, who=None):
+    import asyncio
+
+    token = access.current.set(who) if who else None
+    try:
+        return asyncio.run(coro)
+    finally:
+        if token is not None:
+            access.current.reset(token)
+
+
+@pytest.fixture
+def host(ctx, settings):
+    h = FakeHost()
+    ctx.http_transport = httpx.MockTransport(h.handler)
+    settings.publish_host = "https://pub.example.org"
+    return h
+
+
+def _manifest(host, pub):
+    pub_id, key = _key_and_id(pub["url"])
+    return pf.open_manifest(pub_id, host.version, host.manifest, key)
+
+
+def test_follow_and_comments_round_trip_and_the_api_shows_no_key(client, ctx, host, seals):
+    s = _meeting(ctx)
+    pub = _publish(client, s.id, where="host", follow=True, comments=True)
+    assert pub["selection"]["follow"] and pub["selection"]["comments"]
+    assert pub["live"] == "offline" and pub["live_reason"] == "" and pub["readers"] == 0
+    again = client.get(f"/api/sessions/{s.id}/publication").json()
+    assert again["selection"] == pub["selection"] and again["live"] == "offline"
+    row = ctx.repo.live_publication(s.id)
+    text = json.dumps([pub, again, client.get("/api/publications").json()])
+    for secret in (row["sign_key"], row["box_key"]):
+        assert secret.hex() not in text and pf.encode_key(secret) not in text
+    assert "sign_key" not in text and "box_key" not in text
+    # Either switch alone is "live" too; none is "off", and so is an old selection.
+    only = _publish(client, s.id, where="host", comments=True)
+    assert only["live"] == "offline"
+    off = _publish(client, s.id, where="host")
+    assert off["live"] == "off" and not off["selection"]["follow"]
+    plain = PublicationSelection.model_validate({"where": "host"})
+    assert plain.follow is False and plain.comments is False
+
+
+def test_live_is_refused_for_this_computer_and_for_meetings_shared_with_us(client, ctx, host):
+    s = _meeting(ctx)
+    for sel in ({"follow": True}, {"comments": True}):
+        r = client.put(f"/api/sessions/{s.id}/publication", json={"where": "local", **sel})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "Live updates and comments need a publish host"
+    assert ctx.repo.live_publication(s.id) is None
+    theirs = _meeting(ctx)
+    with ctx.repo._lock, ctx.repo._conn:
+        ctx.repo._conn.execute("UPDATE sessions SET shared_from='ab' WHERE id=?", (theirs.id,))
+    r = client.put(f"/api/sessions/{theirs.id}/publication", json={"where": "host", "follow": True})
+    assert r.status_code == 400 and "Someone shared this meeting with you" in r.json()["detail"]
+    # Publishing it without the switches stays as it is.
+    assert _publish(client, theirs.id, where="host")["live"] == "off"
+
+
+def test_owner_keys_are_made_once_kept_across_versions_and_named_only_while_a_switch_is_on(
+    client, ctx, host, seals
+):
+    from mnemosyne.services import pub_live_format as plf
+
+    s = _meeting(ctx)
+    pub = _publish(client, s.id, where="host")
+    assert _manifest(host, pub).live is None
+    row = ctx.repo.live_publication(s.id)
+    assert row["sign_key"] is None and row["box_key"] is None
+
+    pub = _publish(client, s.id, where="host", follow=True)
+    row = ctx.repo.live_publication(s.id)
+    assert len(row["sign_key"]) == 32 and len(row["box_key"]) == 32
+    keys = plf.OwnerKeys(sign=row["sign_key"], box=row["box_key"])
+    assert _manifest(host, pub).live == keys.live()
+    first = (row["sign_key"], row["box_key"])
+
+    # Switches off: the keys stay on the row, the manifest stops naming them.
+    pub = _publish(client, s.id, where="host")
+    assert _manifest(host, pub).live is None
+    row = ctx.repo.live_publication(s.id)
+    assert (row["sign_key"], row["box_key"]) == first
+    # Back on (the other switch): the same pair.
+    pub = _publish(client, s.id, where="host", comments=True)
+    assert _manifest(host, pub).live == keys.live()
+    row = ctx.repo.live_publication(s.id)
+    assert (row["sign_key"], row["box_key"]) == first
+    assert "sign_key" not in repr(keys) and first[0].hex() not in repr(keys)
+
+
+def test_turning_a_switch_on_is_a_new_version_that_is_not_behind(client, ctx, host, seals):
+    """`live` is not part of the digest: the meeting shows the same, so nothing is "behind". A
+    switch lives in the selection, which only a publish changes, and a publish is always a new
+    version carrying `live`, so there is no state in which a switch is on and the keys are not
+    out (the dialog's Update is what turns it on)."""
+    s = _meeting(ctx)
+    plain = _publish(client, s.id, where="host")
+    digest_before = ctx.repo.live_publication(s.id)["published_digest"]
+    on = _publish(client, s.id, where="host", follow=True)
+    assert on["version"] == plain["version"] + 1 and not on["behind"]
+    assert ctx.repo.live_publication(s.id)["published_digest"] == digest_before
+    assert _manifest(host, on).live is not None
+    assert client.get(f"/api/sessions/{s.id}/publication").json()["behind"] is False
+
+
+def test_an_automatic_version_is_a_history_line_without_a_seal(client, ctx, host, seals):
+    s = _meeting(ctx)
+    ann = access.Principal("u-ann", "Ann", "admin")
+    sel = PublicationSelection(where="host", follow=True)
+    first = asyncio_run(publishing.publish(ctx, s.id, sel, _Job()), ann)
+    assert first["publication"]["version"] == 1
+    assert seals == [(s.id, publishing.SEAL_PUBLISHED)]
+    ctx.repo.update_fields(s.id, summary="Ana Lopez and Bo decided to ship Monday.")
+    assert client.get(f"/api/sessions/{s.id}/publication").json()["behind"]
+
+    other = access.Principal("u-bot", "The watcher", "admin")
+    out = _auto(ctx, s.id, sel, who=other)
+    assert out["publication"]["version"] == 2 and not out["publication"]["behind"]
+    row = ctx.repo.live_publication(s.id)
+    assert row["version"] == 2 and row["published_by"] == "Ann"
+    assert seals == [(s.id, publishing.SEAL_PUBLISHED)]  # no new seal
+    kinds = [e["kind"] for e in ctx.repo.events(s.id)]
+    assert kinds.count("published") == 1 and kinds.count("publication_auto_updated") == 1
+    assert "publication_updated" not in kinds
+    event = next(e for e in ctx.repo.events(s.id) if e["kind"] == "publication_auto_updated")
+    assert event["detail"]["version"] == 2 and event["detail"]["publication"] == row["id"]
+    assert host.version == 2
+    # An automatic version needs a publication to update.
+    with pytest.raises(publishing.PublishError):
+        _auto(ctx, _meeting(ctx).id, sel)
+    # A manual update after it seals as an update again.
+    _publish(client, s.id, where="host", follow=True)
+    assert seals[-1] == (s.id, publishing.SEAL_UPDATED)
+
+
+def test_images_are_frozen_into_the_selection_only_while_following(client, ctx, host, seals):
+    s, (a, b) = _picture_meeting(ctx, webp(), jpeg())
+    pub = _publish(client, s.id, where="host", notes=True)
+    assert pub["selection"]["images"] is None  # not following: "all of them" stays open
+    pub = _publish(client, s.id, where="host", notes=True, follow=True)
+    assert pub["selection"]["images"] == [a, b] and not pub["behind"]
+    assert ctx.repo.live_publication(s.id)["selection"]["images"] == [a, b]
+    # A picture pasted in later does not go out, and is not "behind" either.
+    extra = jpeg(300, 200)
+    info = notes_media.store(ctx, s.id, sha(extra), extra)
+    late = value(extra, info.ext, info.width, info.height)
+    notes = ctx.repo.get(s.id).notes + f"![Late](mnemosyne:image/{late})\n"
+    ctx.repo.update_fields(s.id, notes=notes)
+    sel = PublicationSelection.model_validate(ctx.repo.live_publication(s.id)["selection"])
+    out = _auto(ctx, s.id, sel)
+    assert len(_manifest(host, out["publication"]).images) == 2  # a and b, not the late one
+    assert "[image: Late]" in _manifest(host, out["publication"]).notes
+    # An explicit choice is left alone; so is comments alone.
+    pub = _publish(client, s.id, where="host", notes=True, images=[b], follow=True)
+    assert pub["selection"]["images"] == [b]
+    pub = _publish(client, s.id, where="host", notes=True, comments=True)
+    assert pub["selection"]["images"] is None
+
+
+def test_a_database_from_before_the_owner_keys_gets_the_columns(tmp_path):
+    from mnemosyne.storage.sqlite import SessionRepository
+
+    path = tmp_path / "old.sqlite"
+    repo = SessionRepository(path)
+    repo.close()
+    import sqlite3
+
+    raw = sqlite3.connect(path)
+    for col in ("sign_key", "box_key"):
+        raw.execute(f"ALTER TABLE publications DROP COLUMN {col}")
+    raw.commit()
+    raw.close()
+    repo = SessionRepository(path)  # migrates
+    s = repo.save(Session(name="x", created_at=datetime(2026, 11, 5, 9, 0)))
+    row = {
+        "id": "a" * 16,
+        "session_id": s.id,
+        "key": b"k" * 32,
+        "token": "t",
+        "place": "host",
+        "version": 1,
+        "selection": {},
+        "created_at": "2026-11-05T09:00:00+00:00",
+        "updated_at": "2026-11-05T09:00:00+00:00",
+        "sign_key": b"s" * 32,
+        "box_key": b"b" * 32,
+    }
+    repo.put_publication(row)
+    got = repo.live_publication(s.id)
+    assert got["sign_key"] == b"s" * 32 and got["box_key"] == b"b" * 32
+    repo.put_publication({**row, "sign_key": None, "box_key": None, "version": 2})
+    assert repo.live_publication(s.id)["sign_key"] is None
+    repo.close()
+    repo = SessionRepository(path)  # opening again changes nothing
+    assert repo.live_publication(s.id)["version"] == 2
+    repo.close()

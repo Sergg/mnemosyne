@@ -455,6 +455,21 @@ Storage and serving:
 - Where a link points: a host link uses `publish_host`, else our host (services/ours.py); a "this computer" link uses the team
   listener, else `phone_url` (`local_reach`); with neither, only 127.0.0.1 can open it.
 
+Live publications (services/live_publications.py; use in [publishing.md](publishing.md), design in
+docs/plans/2026-11-05-live-publications.md). A hosted publication stays a sealed snapshot per version; "live"
+adds two things beside it. A watcher polls the library-sync change log every 5 s and, for a meeting whose
+selection has `follow`, submits the ordinary `publish` job with the stored selection once the meeting has been
+quiet 10 s (at most 60 s of waiting, 30 s between versions), so nothing a reader gets can exceed the selection.
+A bridge per publication keeps a room on the same publish host (its id is stored by the host as `X-Pub-Room`,
+set with `PUT /pub/{id}/room`) and sends signed `VERSION` frames, which the viewer answers by fetching and
+checking the new manifest; without a room (older host, "this computer") the viewer polls the ETag every minute.
+Reader comments come back as `COMMENT` frames boxed to the owner's X25519 key and signed per reader; the bridge
+writes them through services/comments.py as `reader:<rid>`, and readers see comments only in signed `THREADS`
+frames built from `publishing.Redaction`, the same redaction the manifest uses. The frame format is
+services/pub_live_format.py (Ed25519 per publication, public half in the sealed manifest's `live` field, FORMAT
+still 1). Unpublish deletes the publication, then the room, so a reader who hears the room go finds the
+publication gone.
+
 ### Our servers
 
 `services/ours.py` is the one place that answers "which relay, which host": `relays()` = `remote_relays`, else
@@ -534,6 +549,22 @@ Concurrent values stay live: `task` with `task_done` is done, otherwise the firs
 two link URLs render as plain text with "(link conflict)". Mark strings over 14 bytes travel as
 0xAF artifact frames. The markdown renderer is canonical and the parser covers what it renders
 (HTML and images stay literal), shared by the fold and the client's paste.
+
+### Sections the backend writes in the notes
+
+The end of a meeting's notes can hold two sections the backend writes: the copilot's lines and the summary
+(docs/plans/2026-11-04-summaries-in-notes.md). A closed `ref` mark on a line's `\n` (notes-core; never in the markdown)
+says what the line is (`sec:<name>`, `sum:<id>`, `cp:<n>`); every fold stores the refs, and services/notes_sections.py
+splits the notes into the person's text and the sections. The backend is the only writer of ref'd lines, and only on
+the machine that recorded the meeting (never for `shared_from`, never on a guest or phone). It writes through
+`shared_notes.edit_blocking`, which folds, lets a compose function rewrite its own lines and sets the text against
+that same state, so typing in between merges as usual; `AFTER_FOLD` hooks see every fold. The copilot appends its
+points once (services/copilot_notes.py, remembered in `CopilotNotes.added`). The summary section is a projection
+of the summary doc (services/notes_summary.py writes it, debounced, from every write of the summary) and flows back
+the same way the Obsidian note does: edits there are taken as hand edits through `summary_doc.apply_human`, by the
+core both share, services/summary_readback.py. Ticks read from the notes are applied after the notes lock is
+released. Readers that must not see the sections (summary prompt, Obsidian, publishing, combine, MCP) read
+`Session.own_notes`; search and sync keep the whole notes.
 
 ### Guest notes (phase 9)
 

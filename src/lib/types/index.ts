@@ -159,7 +159,13 @@ export type BackendEvent =
   | ({ type: 'recovered' } & RecoveredRecording)
   | { type: 'pong' }
   | { type: 'job'; job: Job }
-  | { type: 'session'; session_id: string; status: SessionStatus | 'deleted' | 'audio_deleted' }
+  | {
+      type: 'session';
+      session_id: string;
+      status: SessionStatus | 'deleted' | 'audio_deleted';
+      // Set when the summary changed in the background (edits read back from the notes or the vault).
+      changed?: 'summary';
+    }
   | { type: 'status'; session_id: string | null; message: string }
   | { type: 'transcription'; session_id: string | null; segment: TranscriptSegment }
   | { type: 'error'; session_id: string | null; message: string }
@@ -181,6 +187,7 @@ export type BackendEvent =
   | { type: 'comments'; session_id: string; mentions: string[] } // a meeting's comments changed; mentions: user ids newly @named
   | { type: 'assets'; session_id: string } // a meeting's resources changed
   | { type: 'notes'; session_id: string } // a meeting's live notes were folded into Session.notes
+  | { type: 'notes_media'; session_id: string; sha256: string } // an image of a meeting's notes was stored here (GET .../notes/media/{sha256})
   | { type: 'history'; session_id: string } // something was added to a meeting's history
   | { type: 'sync'; peer: string; state: SyncPeerState; done: number; total: number } // library sync with a peer
   | { type: 'share_outbox'; session_id: string; pending: number } // what I did on a meeting shared with me waits to be sent to its owner

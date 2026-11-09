@@ -3,11 +3,15 @@
 //! document.
 //!
 //! One markdown line per document line, except that consecutive code lines become one fence
-//! and a table gets its separator row after the head. A blank line is added between two
-//! blocks a markdown reader would otherwise join ([`needs_gap`]): the parser drops exactly
-//! that one again.
+//! and a table gets its separator row after the head. An image line is
+//! `![<caption>](mnemosyne:image/<value>)`, the caption escaped as link text. A blank line is
+//! added between two blocks a markdown reader would otherwise join ([`needs_gap`]): the
+//! parser drops exactly that one again. A line's `ref` is never written ([`md_lines`] says
+//! where each line went instead).
 
-use crate::model::{normalize, Block, Fmt, Link, Model, BOLD, CELL, CODE, ITALIC, STRIKE};
+use crate::model::{
+    normalize, Block, Fmt, Link, Model, BOLD, CELL, CODE, IMAGE_URL, ITALIC, STRIKE,
+};
 
 /// What a fold or set_text reports: the markdown (what `Session.notes` holds) and the plain
 /// text (search). See [`plain`].
@@ -44,17 +48,19 @@ pub(crate) struct Sig {
 }
 
 /// Would markdown join `b` into `a` (or misread either) without a blank line between them?
-/// List, quote and table lines take a following paragraph line as a continuation; a table
-/// runs into the next table; a paragraph absorbs a table head, turns an empty list item
-/// into a setext underline, and becomes a table head over a line that looks like a
-/// separator row.
+/// List, quote and table lines take a following paragraph or image line as a continuation;
+/// a table runs into the next table; a paragraph absorbs a table head, turns an empty list
+/// item into a setext underline, and becomes a table head over a line that looks like a
+/// separator row; an image line (a paragraph to a markdown reader) is followed by a list or
+/// a table head only after a blank line.
 pub(crate) fn needs_gap(a: &Sig, b: &Sig) -> bool {
     let continues =
         |k: Option<Block>| k.is_some_and(|k| k.is_list() || k.is_table() || k == Block::Quote);
     match (a.kind, b.kind) {
-        (ak, None) if continues(ak) => true,
+        (ak, None | Some(Block::Image)) if continues(ak) => true,
         (Some(ak), Some(Block::TableHead)) if ak.is_table() => true,
         (None, Some(Block::TableHead)) => true,
+        (Some(Block::Image), Some(bk)) if bk.is_list() || bk == Block::TableHead => true,
         (None, Some(Block::Bullet | Block::Number)) if b.empty => true,
         (None, _) => has_unescaped_pipe(&a.md) && is_delimiter_row(&b.md),
         _ => false,
@@ -84,25 +90,45 @@ pub(crate) fn is_delimiter_row(line: &str) -> bool {
         })
 }
 
+/// Per document line (of `model` normalized: one per line, the last one even without its
+/// `\n`), the 0-based line of [`render`]'s markdown where its rendering starts: its own line;
+/// for a code run's first line the opening fence; for a table's head the head row (the
+/// separator row after it is no line's); for an empty line one of the blank lines before
+/// the next block, the gap the renderer adds being the last of them. What
+/// [`crate::parse::parse_lines`] gives back for that markdown.
+pub fn md_lines(model: &Model) -> Vec<usize> {
+    markdown_lines(model).1
+}
+
 fn markdown(model: &Model) -> String {
+    markdown_lines(model).0
+}
+
+/// The markdown and [`md_lines`].
+fn markdown_lines(model: &Model) -> (String, Vec<usize>) {
     let m = normalize(model);
     let spans = m.line_spans();
     let mut out: Vec<String> = Vec::new();
+    let mut starts: Vec<usize> = vec![0; spans.len()];
     let mut last: Option<Sig> = None;
-    let mut pending = 0usize;
+    // The empty lines waiting for the next block.
+    let mut pending: Vec<usize> = Vec::new();
     let mut number = 0usize;
     let mut li = 0;
     while li < spans.len() {
         let (s, e, _) = spans[li];
         let kind = m.lines[li].kind;
         if kind.is_none() && s == e {
-            pending += 1;
+            pending.push(li);
             number = 0;
             li += 1;
             continue;
         }
         // Render this line (or run) first: the gap depends on its first markdown line.
+        let first_line = li;
         let mut block: Vec<String> = Vec::new();
+        // Where each document line of the block starts, from the block's first line.
+        let mut offsets: Vec<usize> = Vec::new();
         let first_kind;
         let last_sig;
         match kind {
@@ -128,6 +154,8 @@ fn markdown(model: &Model) -> String {
                     .unwrap_or(0);
                 let fence: String = std::iter::repeat_n(fence_char, (longest + 1).max(3)).collect();
                 block.push(format!("{fence}{lang}"));
+                // The first line starts at the fence, the others at their own lines.
+                offsets.extend((0..texts.len()).map(|j| if j == 0 { 0 } else { j + 1 }));
                 block.extend(texts);
                 block.push(fence);
                 first_kind = Some(Block::Code);
@@ -173,6 +201,8 @@ fn markdown(model: &Model) -> String {
                 for row in &rows[1..] {
                     block.push(row_md(row));
                 }
+                // The head at its row, the rows after the separator.
+                offsets.extend((0..rows.len()).map(|j| if j == 0 { 0 } else { j + 1 }));
                 first_kind = Some(Block::TableHead);
                 last_sig = Sig {
                     kind: Some(Block::Table),
@@ -180,6 +210,22 @@ fn markdown(model: &Model) -> String {
                     md: String::new(),
                 };
                 number = 0;
+            }
+            Some(Block::Image) => {
+                let value = m.lines[li]
+                    .image
+                    .as_deref()
+                    .expect("normalize keeps a value on image lines");
+                let line = format!("![{}]({IMAGE_URL}{value})", caption(&m.text[s..e]));
+                first_kind = kind;
+                last_sig = Sig {
+                    kind,
+                    empty: s == e,
+                    md: line.clone(),
+                };
+                block.push(line);
+                number = 0;
+                li += 1;
             }
             _ => {
                 let content = inline(&m, s, e, false);
@@ -196,7 +242,9 @@ fn markdown(model: &Model) -> String {
                     Some(Block::Task) => prefixed("- [ ]", &escape_line_start(&content, false)),
                     Some(Block::TaskDone) => prefixed("- [x]", &escape_line_start(&content, false)),
                     Some(Block::Quote) => prefixed(">", &escape_line_start(&content, false)),
-                    Some(Block::Code | Block::Table | Block::TableHead) => unreachable!(),
+                    Some(Block::Code | Block::Table | Block::TableHead | Block::Image) => {
+                        unreachable!()
+                    }
                 };
                 if kind != Some(Block::Number) {
                     number = 0;
@@ -217,14 +265,25 @@ fn markdown(model: &Model) -> String {
             md: block[0].clone(),
         };
         let gap = last.as_ref().is_some_and(|a| needs_gap(a, &first));
-        for _ in 0..pending + usize::from(gap) {
+        for &empty in &pending {
+            starts[empty] = out.len();
             out.push(String::new());
         }
-        pending = 0;
+        if gap {
+            out.push(String::new());
+        }
+        pending.clear();
+        if offsets.is_empty() {
+            offsets.push(0); // a single line
+        }
+        for (j, offset) in offsets.into_iter().enumerate() {
+            starts[first_line + j] = out.len() + offset;
+        }
         out.extend(block);
         last = Some(last_sig);
     }
-    for _ in 0..pending {
+    for &empty in &pending {
+        starts[empty] = out.len();
         out.push(String::new());
     }
     let mut md = String::new();
@@ -232,7 +291,7 @@ fn markdown(model: &Model) -> String {
         md.push_str(&line);
         md.push('\n');
     }
-    md
+    (md, starts)
 }
 
 fn prefixed(prefix: &str, content: &str) -> String {
@@ -337,6 +396,23 @@ fn inline(m: &Model, s: usize, e: usize, in_cell: bool) -> String {
     }
     while let Some(tok) = stack.pop() {
         close(m, tok, in_cell, &mut out);
+    }
+    out
+}
+
+/// An image's caption as link text: plain (formats on it mean nothing), every bracket
+/// escaped, the rest as in any other text.
+fn caption(chars: &[char]) -> String {
+    let edges = Edges {
+        in_link: true,
+        in_cell: false,
+        link_next: false,
+        strike_before: false,
+        strike_after: false,
+    };
+    let mut out = String::new();
+    for k in 0..chars.len() {
+        escape_char(chars, k, &edges, &mut out);
     }
     out
 }

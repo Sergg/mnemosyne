@@ -189,6 +189,13 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
   Cloudflare quick tunnel). Keep it that way.
 - Guest frames carry a full snapshot: 8 MiB + 64 KiB, in BOTH frame.rs copies (link/src/guest/frame.rs and
   guest-wasm/src/frame.rs). They must match.
+- Never hold a notes lock (shared_notes) while calling `item_flags` / `task_links` fan-out: linked meetings take their
+  own notes locks and two folds deadlock. `notes_summary.read_back` runs ticks in a daemon thread after the fold.
+- Reader threads and the manifest are redacted by ONE implementation, `publishing.Redaction` (names, identifiers, the attendee
+  list). `threads_for_readers` must keep using it; a second copy would let an owner's reply leak a name the manifest hides.
+- Anything sent to readers of a publication goes through a pub-live frame type with `extra="forbid"` (a test asserts the key set
+  of every outgoing frame). Never add a field to THREADS/META/VERSION that carries text not already in the manifest.
+
 - Never `pgrep`/`pkill` with a pattern that appears in your own command line; use the
   `pgre[p]` bracket trick or `fuser -k <port>/tcp`. A `uv run uvicorn` child survives
   killing the `uv` wrapper; kill by port.
@@ -206,6 +213,9 @@ extra out uninstalls it; `onnx` is Parakeet). The `gpu` extra pulls torch
 - Notes clients must `applyFrontier(encodeFrontier())` after applying remote frames or opening a
   snapshot (hashseq QUEUE 39) or the next drain ships everything back; mark strings over 14 bytes
   (URLs, `comment:<id>`) travel as 0xAF artifact frames beside the 0xDE delta, never inside it.
+- Never put an image's bytes in a notes frame, snapshot or fold: they stay in the media store and travel by their sha
+  (a snapshot with images in it would ship every image to every client on every join). Anything reading an image
+  must check the sha and the type by magic number first, and `src` comes from the host's object URLs only.
 - Indexes in the notes model and the sidecar are code points, not UTF-16 (src/lib/notes/model.ts
   `cpLen`/`cpIndex`/`utf16Index`); an astral character is 1 there and 2 in a JS string.
 - Notes chips are `link` marks with `mnemosyne:` URLs; dom.ts gives an `href` only to http(s) and mailto, so a chip
@@ -584,6 +594,55 @@ shows the effective one). Guest notes: iroh through our relay plus the mirror on
 gained `--write-bytes-per-day` (200 MiB per client, 429 `write_budget`, rooms close 4429) and `--metrics-listen`. link:
 `rooms --no-relay`, `home --no-relay` (mDNS stays), `home --no-lan`, `relay-check --relay` (`MNEMOSYNE_RELAY_CA`). No
 migration: computers paired under n0 are paired again. CI: job "Our relay and host (deploy/ours)" and ours-health.yml.
+
+Images in the notes (released as 0.28.0, docs/plans/2026-10-26-images-in-notes.md, build order and changes in
+2026-11-04-images-tasks.md, use in docs/api-reference.md "Images in the notes", guest-notes.md, publishing.md): paste,
+drop or `/Image` a picture into the notes; guests too, a phone's camera included. An image is a notes line of kind `image`
+(notes-core `Block::Image`: the caption is the text, a closed `image` mark on the `\n` holds `<sha256>.<webp|jpeg>@<w>x<h>`;
+markdown `![caption](mnemosyne:image/<value>)`; two live values resolve to the first). The bytes live beside the document,
+never in it: services/notes_media.py (`<data_dir>/notes_media/<session>/<sha>.<ext>`, sealed with encryption at rest, a
+`notes_media` row each, `notes_media` bus event) behind `PUT|GET /api/sessions/{id}/notes/media/{sha}`
+(api/routes/notes_media.py, the notes' own access rules). The browser decodes, shrinks to 1600 px and re-encodes
+(src/lib/notes/prepareImage.ts, images.ts; the line goes in at once, the upload runs beside it), the desktop's provider is
+src/lib/app/notesMedia.ts, the guest page's guest/src/media.ts. Guests have only the room socket: guest_format kind MEDIA
+(6, padded to 64 KiB, the plaintext sha in the AAD, stored under an HMAC of the sha), publish-host socket kinds 0x04/0x05 and
+`get_media`, HTTP `/live/{room}/media/{name}` for the owner's bridge, which waits up to 30 s for an upload before a frame
+naming it. Travelling: `SyncSession.media` + `GET /api/sync/media/...`, `SharedMeeting.media` + `GET /api/share/media/...`
+(recipients cannot add images in v1), a publication's third blob kind `image` (kept in `clip_blobs` as `image:<sha>`;
+`PublicationSelection.images`, null = all; left out = `[image: caption]`), Obsidian `attachments/`, `plain_notes` =
+`[image: caption]`. Rules: type by magic number, WebP and JPEG only; the sha is checked on every receive path (upload,
+sync, share, bridge, viewer, guest); `img.src` is set only from the provider's object URLs, never from a `mnemosyne:`
+address; a blob nothing has shown for 7 days is swept (after one more fold of the meeting); caps 2,000,000 bytes an image,
+50,000,000 a meeting, 25,000,000 a room (2 MiB + 128 KiB sealed a blob), 20 MiB per publication with clips.
+
+Live publications (released as 0.30.0, docs/plans/2026-11-05-live-publications.md, use in docs/publishing.md, bytes in the plan's "Data
+and formats"): a hosted publication can be kept up to date (`PublicationSelection.follow`) and take reader comments
+(`comments`, `moderate`, `moderated_since`); "this computer" and the file never go live. services/live_publications.py has the
+watcher (polls the change log every 5 s; quiet 10 s, `MAX_WAIT` 60 s, `GAP` 30 s; submits the ordinary `publish` job with the
+STORED selection and `auto=True`: history `publication_auto_updated`, no seal; `images: None` frozen to a list) and `PubBridge`
+(a guest-notes-style room on the publication's host, its id kept by the host as `Meta.room`: `X-Pub-Room`, `PUT /pub/{id}/room`
+in publish-host/src/app.rs; `<pub_dir>/room.json`, `readers.json`). Frames: services/pub_live_format.py (own AAD namespace
+`mnemosyne/pub-live/1`, kinds VERSION/THREADS/META/COMMENT; guest_format's `Space`), TS in src/lib/sealed/, vectors
+backend/tests/vectors/publication_live_v1.json. Security rule: every room member holds the frames key, so owner frames
+(VERSION, THREADS, META) are signed with a per-publication Ed25519 key (`sign_key`/`box_key` on the publications row, never in
+the API, records or history; public halves in the sealed manifest's optional `live`, FORMAT stays 1), the viewer drops what does
+not verify, reader COMMENT ops are boxed to the owner's X25519 key and signed by a key in the reader's browser (`rid` = hash of its
+public key; a cleared browser is a new reader), and THREADS (reader-started threads only, redacted) is the only way readers see
+comments. Comments apply as actor `reader:<rid>`; `comments.approve`/`hide` (`approved_at`/`hidden_at`, owner rights) filter
+THREADS. Viewer: viewer/src/live.ts, ReaderComments.svelte; owner side: PublishDialog.svelte, CommentThread.svelte. Unpublish
+deletes the publication, then the room (the plan says room first; the code's order lets a reader who hears 4410 find 410). An older
+host (no pointer route) gives `live = "unsupported"`: versions still upload, viewers poll each minute.
+
+Summaries in the notes (released as 0.29.0, docs/plans/2026-11-04-summaries-in-notes.md): the live copilot adds each new point
+once to the notes under a Copilot heading (`copilot_to_notes`), and a summarize writes a Summary section in its place that
+follows the summary and flows back (`summary_in_notes`). notes-core `ref` line mark (`sec:<name>`, `sum:<id>`, `cp:<n>`;
+set_text `refs`, answers carry `refs` and `tasks[].ref`), services/notes_sections.py (split/compose, `own_notes`),
+shared_notes.edit_blocking + `AFTER_FOLD` hooks, services/copilot_notes.py (`CopilotNotes.added`), notes_summary.py
+(`register()` at startup, summary_doc `notes` slot), summary_readback.py (the core shared with vault_sync), the
+`mnemosyne:by/copilot` chip. Rules: only the backend writes ref'd lines, only on the origin machine, never for
+`shared_from`; readers that must not see the sections read `Session.own_notes` (None = not worked out: use `notes`);
+summary action items in the notes are never notes items; ticks from the notes run outside the notes lock; the
+editor keeps a ref on the line holding the original text and never gives one to a new line.
 
 Candidates next: offline installer (pre-seeded uv cache). Flathub is on hold (Corey, 2026-09-29).
 

@@ -47,10 +47,16 @@ function defaults(extra: Partial<PublicationDefaults> = {}): PublicationDefaults
 		quotes: [],
 		where: 'local',
 		expires_days: 90,
+		follow: false,
+		comments: false,
+		moderate: false,
+		moderated_since: null,
 		local_reach: 'this_device',
 		local_url: '',
 		host_url: '',
 		host_is_ours: false,
+		images: null,
+		notes_images: [],
 		...extra
 	};
 }
@@ -72,6 +78,7 @@ function fakeApi(over: Partial<PublishingApi> = {}) {
 		listPublications: vi.fn(async () => []),
 		startPublicationFile: vi.fn(async (_id: string, _sel: PublicationSelection, _password: string | null) => job('running')),
 		getJob: vi.fn(async () => job('completed', { publication: { id: 'p1', version: 1 } })),
+		fetchNotesImage: vi.fn(async (_id: string, _sha: string) => new Blob(['x'], { type: 'image/webp' })),
 		saveFile: vi.fn(async () => {})
 	};
 	return { ...base, ...over } as typeof base;
@@ -96,6 +103,69 @@ describe('the Publish dialog store', () => {
 		expect(api.previewPublication).toHaveBeenCalledTimes(1); // the first preview is not delayed
 	});
 
+	it('turns follow and comments on for a new hosted publication and off away from a host', async () => {
+		const api = fakeApi({ getPublicationDefaults: vi.fn(async () => defaults({ where: 'host', host_url: 'https://h' })) });
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.target).toBe('host');
+		expect(st.selection).toMatchObject({ follow: true, comments: true });
+		st.setTarget('local');
+		expect(st.selection).toMatchObject({ follow: false, comments: false });
+		expect(st.toSend()).toMatchObject({ where: 'local', follow: false, comments: false });
+		st.setTarget('host');
+		expect(st.selection).toMatchObject({ follow: true, comments: true });
+		st.setTarget('file');
+		expect(st.selection).toMatchObject({ follow: false, comments: false });
+	});
+
+	it('approval starts off, and is sent only for a hosted publication that takes comments', async () => {
+		const api = fakeApi({ getPublicationDefaults: vi.fn(async () => defaults({ where: 'host', host_url: 'https://h' })) });
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.selection).toMatchObject({ comments: true, moderate: false });
+		expect(st.toSend()).toMatchObject({ moderate: false });
+		st.set({ moderate: true });
+		expect(st.toSend()).toMatchObject({ comments: true, moderate: true });
+		st.set({ comments: false }); // the choice is kept in the dialog, but does not count
+		expect(st.selection?.moderate).toBe(true);
+		expect(st.toSend()).toMatchObject({ comments: false, moderate: false });
+		st.set({ comments: true });
+		expect(st.toSend()?.moderate).toBe(true);
+		st.setTarget('local');
+		expect(st.toSend()).toMatchObject({ where: 'local', moderate: false });
+	});
+
+	it('keeps a saved publication\'s approval choice', async () => {
+		const saved = { id: 'p1', version: 2 } as unknown as Publication;
+		const api = fakeApi({
+			getPublication: vi.fn(async () => saved),
+			getPublicationDefaults: vi.fn(async () =>
+				defaults({ where: 'host', host_url: 'https://h', comments: true, moderate: true, moderated_since: '2026-11-05T10:00:00Z' })
+			)
+		});
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.selection).toMatchObject({ comments: true, moderate: true });
+	});
+
+	it('keeps a saved publication\'s switches, and a local new one starts off', async () => {
+		const saved = { id: 'p1', version: 2 } as unknown as Publication;
+		const api = fakeApi({
+			getPublication: vi.fn(async () => saved),
+			getPublicationDefaults: vi.fn(async () => defaults({ where: 'host', host_url: 'https://h', follow: false, comments: true }))
+		});
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.selection).toMatchObject({ follow: false, comments: true });
+		st.setTarget('local');
+		st.setTarget('host'); // not new: nothing is switched on for the person
+		expect(st.selection).toMatchObject({ follow: false, comments: false });
+
+		const local = new PublishingState(fakeApi(), 400, 10);
+		await local.open(session);
+		expect(local.selection).toMatchObject({ follow: false, comments: false });
+	});
+
 	it('debounces the preview: one request with the latest choices', async () => {
 		const api = fakeApi();
 		const st = new PublishingState(api, 400, 10);
@@ -111,6 +181,78 @@ describe('the Publish dialog store', () => {
 		const sent = api.previewPublication.mock.calls[0][1];
 		expect(sent.decisions).toBe(false);
 		expect(sent.title).toBe('Shared');
+	});
+
+	it('lists the notes images, all in; unticking sends the rest, ticking them all again sends null', async () => {
+		const images = [
+			{ sha256: 'a'.repeat(64), caption: 'Board', width: 640, height: 480, size: 1000 },
+			{ sha256: 'b'.repeat(64), caption: '', width: 10, height: 10, size: 20 },
+			{ sha256: 'c'.repeat(64), caption: 'Plan', width: 10, height: 10, size: 30 }
+		];
+		const api = fakeApi({ getPublicationDefaults: vi.fn(async () => defaults({ notes: true, notes_images: images })) });
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.notesImages.map((i) => i.caption)).toEqual(['Board', '', 'Plan']);
+		expect(st.selection).not.toHaveProperty('notes_images');
+		expect(images.every((i) => st.imageIncluded(i.sha256))).toBe(true);
+		expect(st.toSend()?.images).toBeNull();
+		st.setImage(images[2].sha256, false);
+		expect(st.toSend()?.images).toEqual([images[0].sha256, images[1].sha256]);
+		expect(st.imageIncluded(images[2].sha256)).toBe(false);
+		st.setImage(images[0].sha256, false);
+		st.setImage(images[1].sha256, false);
+		expect(st.toSend()?.images).toEqual([]); // none: not null
+		st.setImage(images[1].sha256, true);
+		expect(st.toSend()?.images).toEqual([images[1].sha256]);
+		st.setImage(images[0].sha256, true);
+		st.setImage(images[2].sha256, true);
+		expect(st.toSend()?.images).toBeNull();
+		// The preview follows each change.
+		api.previewPublication.mockClear();
+		st.setImage(images[0].sha256, false);
+		await vi.advanceTimersByTimeAsync(400);
+		expect(api.previewPublication.mock.calls[0][1].images).toEqual([images[1].sha256, images[2].sha256]);
+	});
+
+	it('starts from a saved image choice', async () => {
+		const images = [
+			{ sha256: 'a'.repeat(64), caption: 'Board', width: 1, height: 1, size: 1 },
+			{ sha256: 'b'.repeat(64), caption: 'Plan', width: 1, height: 1, size: 1 }
+		];
+		const api = fakeApi({
+			getPublicationDefaults: vi.fn(async () => defaults({ notes: true, notes_images: images, images: ['b'.repeat(64)] }))
+		});
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(st.imageIncluded('a'.repeat(64))).toBe(false);
+		expect(st.imageIncluded('b'.repeat(64))).toBe(true);
+		expect(st.toSend()?.images).toEqual(['b'.repeat(64)]);
+	});
+
+	it('fetches an image once for the dialog and revokes its URL when it closes', async () => {
+		URL.createObjectURL = vi.fn(() => 'blob:thumb');
+		URL.revokeObjectURL = vi.fn();
+		const api = fakeApi();
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		expect(await st.imageUrl('a'.repeat(64))).toBe('blob:thumb');
+		expect(await st.imageUrl('a'.repeat(64))).toBe('blob:thumb');
+		expect(api.fetchNotesImage).toHaveBeenCalledTimes(1);
+		expect(api.fetchNotesImage).toHaveBeenCalledWith('s1', 'a'.repeat(64));
+		st.close();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:thumb');
+		await expect(st.imageUrl('a'.repeat(64))).rejects.toThrow(/closed/);
+	});
+
+	it('does not keep a failed image fetch', async () => {
+		URL.createObjectURL = vi.fn(() => 'blob:ok');
+		const api = fakeApi();
+		api.fetchNotesImage.mockRejectedValueOnce(new Error('404: gone'));
+		const st = new PublishingState(api, 400, 10);
+		await st.open(session);
+		await expect(st.imageUrl('a'.repeat(64))).rejects.toThrow('404');
+		expect(await st.imageUrl('a'.repeat(64))).toBe('blob:ok');
 	});
 
 	it('keeps the newest preview when an older answer arrives late', async () => {

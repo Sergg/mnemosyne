@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { getHistory, recoverSession } from '$lib/api/backend.js';
 	import { audioReason } from '$lib/app/access.js';
+	import { groupHistory } from '$lib/app/historyGroups.js';
 	import { sessionState } from '$lib/stores/session.svelte.js';
 	import { jobsState } from '$lib/stores/jobs.svelte.js';
 	import { toastState } from '$lib/stores/toast.svelte.js';
@@ -231,6 +232,21 @@
 				return `Flagged lines reviewed${d.by ? ` by ${d.by}` : ''}${d.note ? `: ${d.note}` : ''}`;
 			case 'consent':
 				return `${CONSENT[d.consent as string] ?? 'Consent recorded'}${d.by ? ` (${d.by})` : ''}`;
+			case 'copilot_notes_added': {
+				const n = (d.count as number | undefined) ?? 0;
+				return `Copilot added ${n} ${n === 1 ? 'point' : 'points'} to the notes`;
+			}
+			case 'notes_summary_written':
+				return 'Summary written into the notes';
+			case 'notes_summary_edits_taken': {
+				const bits = [
+					d.items ? `${d.items} ${d.items === 1 ? 'action item' : 'action items'}` : '',
+					d.decisions ? `${d.decisions} ${d.decisions === 1 ? 'decision' : 'decisions'}` : '',
+					d.questions ? `${d.questions} ${d.questions === 1 ? 'question' : 'questions'}` : '',
+					d.body ? 'the summary text' : ''
+				].filter(Boolean);
+				return `Edits to the notes' summary taken into the summary${bits.length ? ` (${bits.join(', ')})` : ''}${d.by ? ` by ${d.by}` : ''}`;
+			}
 			case 'guest_notes_started':
 				return `Guest notes started${d.by ? ` by ${d.by}` : ''}`;
 			case 'guest_notes_ended':
@@ -265,6 +281,12 @@
 				return e.kind.replaceAll('_', ' ');
 		}
 	}
+	function rowText(row: { event: HistoryEvent; count: number; last: HistoryEvent }): string {
+		if (row.event.kind !== 'publication_auto_updated') return describe(row.event);
+		if (row.count === 1) return `Link kept up to date (version ${(row.event.detail as Record<string, unknown>).version})`;
+		return `Link kept up to date: ${row.count} versions, last ${new Date(row.last.at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
+	}
+	const rows = $derived(history ? groupHistory(history.events) : []);
 	const bad = (kind: string) =>
 		['save_failed', 'interrupted', 'recover_failed', 'capture_problem', 'transcribe_failed', 'summarize_failed', 'hubspot_failed'].includes(kind);
 
@@ -370,10 +392,11 @@
 			<div>
 				<h5 class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">What happened</h5>
 				<ol class="space-y-0.5 text-xs" aria-label="What happened">
-					{#each history.events as e, i (i)}
+					{#each rows as row, i (i)}
+						{@const e = row.event}
 						<li class="flex gap-2">
 							<span class="w-24 shrink-0 whitespace-nowrap font-mono text-gray-600" title={new Date(e.at).toLocaleString()}>{clock(e.at)}</span>
-							<span class={bad(e.kind) ? 'text-amber-300' : 'text-gray-300'}>{describe(e)}</span>
+							<span class={bad(e.kind) ? 'text-amber-300' : 'text-gray-300'}>{rowText(row)}</span>
 						</li>
 					{/each}
 				</ol>

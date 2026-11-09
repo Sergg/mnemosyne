@@ -12,12 +12,15 @@ Rules, exactly as implemented:
 - `frames_key = HKDF-SHA256(key, salt=b"", info=b"mnemosyne/guest/frames", length=32)`;
   `room_token = b64url(HKDF-SHA256(key, salt=b"", info=b"mnemosyne/guest/room", length=32))`.
   The host sees and compares the room token only; it never gets the key or the frames key.
-- kinds (one byte): NOTES=1, SNAPSHOT=2, COMMENT=3, META=4, PRESENCE=5.
+- kinds (one byte): NOTES=1, SNAPSHOT=2, COMMENT=3, META=4, PRESENCE=5, MEDIA=6.
 - envelope = kind(1) || nonce(12, random) || AES-256-GCM(frames_key, nonce, padded) where
   padded = 4-byte big-endian length, the plaintext, zeros up to a multiple of 256 bytes
-  (4096 for SNAPSHOT), i.e. publication_format.pad/unpad. The ciphertext carries a 16-byte tag.
+  (4096 for SNAPSHOT, 65536 for MEDIA), i.e. publication_format.pad/unpad. The ciphertext carries
+  a 16-byte tag.
 - AAD = UTF-8 of "mnemosyne/guest/1|<room>|<kind as decimal>". The kind byte is also in the
-  AAD, so changing it, or moving an envelope to another room, fails to open.
+  AAD, so changing it, or moving an envelope to another room, fails to open. MEDIA's AAD has one
+  more field, "mnemosyne/guest/1|<room>|6|<sha>", where sha is the plaintext's SHA-256 as 64
+  lowercase hex characters; it is required for MEDIA and refused for every other kind.
 - NOTES plaintext = u8 len(gid) || gid || u8 len(name) || name || frame (gid and name UTF-8).
   `gid` is the guest page's random id ("" for the owner's side); `name` is what the person typed
   (truncated at a character boundary to 255 bytes); `frame` is an opaque hashseq frame that must
@@ -36,6 +39,21 @@ Rules, exactly as implemented:
             heartbeat, "o:<member key>" one of the owner-side editors; older pages ignore the
             optional fields)
   (this module checks that the JSON parses; the shapes belong to the bridge and the page.)
+- MEDIA (an image of the notes) plaintext = the raw bytes, at most MEDIA_MAX (2,000,000); not JSON,
+  and `unseal_media` checks that sha256(bytes) == sha. A reader asks for a blob by its sha, which
+  the notes carry, but the relay stores and serves it under `media_name(key, sha)` =
+  hex(HMAC-SHA256(media_name_key, sha as the 64 ASCII hex characters)) with
+  `media_name_key = HKDF-SHA256(key, salt=b"", info=b"mnemosyne/guest/media-name", length=32)`:
+  every holder of the key can compute it, the host sees an opaque name (a sealed blob's own hash
+  cannot serve, AES-GCM nonces are random). The plain `seal`/`unseal` take the sha as a keyword
+  (`unseal` refuses a MEDIA envelope without it); the MEDIA kind is additive, FORMAT stays 1.
+
+Namespaces (live publications, docs/plans/2026-11-05-live-publications.md C5): the envelope,
+the key derivation and the AAD are parameterised by a `Space` (AAD prefix, HKDF infos, kinds,
+block sizes, the JSON kinds, the media kind). Every function takes `space=GUEST` as a keyword,
+so the rules above are the guest space and nothing about it changed. Another space
+(services/pub_live_format.py `PUB_LIVE`) derives other keys from the same 32-byte key and binds
+another prefix into every AAD, so a frame of one space never opens in the other.
 """
 
 from __future__ import annotations
@@ -43,6 +61,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 from . import publication_format as pf
@@ -51,16 +71,20 @@ FORMAT = 1
 AAD_PREFIX = f"mnemosyne/guest/{FORMAT}"
 INFO_FRAMES = b"mnemosyne/guest/frames"
 INFO_ROOM = b"mnemosyne/guest/room"
+INFO_MEDIA_NAME = b"mnemosyne/guest/media-name"
 KEY_SIZE = pf.KEY_SIZE
 NONCE_SIZE = pf.NONCE_SIZE
 TAG_SIZE = pf.TAG_SIZE
 ROOM_HEX_LEN = 16
 BLOCK = 256
 SNAPSHOT_BLOCK = 4096
+MEDIA_BLOCK = 65536
+MEDIA_MAX = 2_000_000
 MAX_FIELD = 255
 FRAME_START = (0xDE, 0xAF)
 
 _ROOM_RE = re.compile(r"^[0-9a-f]{16}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Kind(IntEnum):
@@ -69,6 +93,7 @@ class Kind(IntEnum):
     COMMENT = 3
     META = 4
     PRESENCE = 5
+    MEDIA = 6
 
 
 JSON_KINDS = (Kind.SNAPSHOT, Kind.COMMENT, Kind.META, Kind.PRESENCE)
@@ -76,6 +101,33 @@ JSON_KINDS = (Kind.SNAPSHOT, Kind.COMMENT, Kind.META, Kind.PRESENCE)
 
 class GuestFormatError(ValueError):
     """The data cannot be sealed or opened; the message says why."""
+
+
+@dataclass(frozen=True)
+class Space:
+    """One namespace of sealed room frames: what goes into the AAD and the HKDF infos, which
+    kind bytes exist and how each pads. `blocks` lists the kinds whose block is not BLOCK."""
+
+    aad_prefix: str
+    info_frames: bytes
+    info_room: bytes
+    kinds: type[IntEnum]
+    info_media_name: bytes | None = None
+    blocks: Mapping[int, int] = field(default_factory=dict)
+    json_kinds: frozenset[int] = frozenset()
+    media_kind: int | None = None
+
+
+GUEST = Space(
+    aad_prefix=AAD_PREFIX,
+    info_frames=INFO_FRAMES,
+    info_room=INFO_ROOM,
+    kinds=Kind,
+    info_media_name=INFO_MEDIA_NAME,
+    blocks={Kind.SNAPSHOT: SNAPSHOT_BLOCK, Kind.MEDIA: MEDIA_BLOCK},
+    json_kinds=frozenset(JSON_KINDS),
+    media_kind=Kind.MEDIA,
+)
 
 
 # ---- ids and keys --------------------------------------------------------------------
@@ -120,69 +172,112 @@ def _hkdf(key: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=info).derive(bytes(key))
 
 
-def frames_key(key: bytes) -> bytes:
-    return _hkdf(key, INFO_FRAMES)
+def frames_key(key: bytes, *, space: Space = GUEST) -> bytes:
+    return _hkdf(key, space.info_frames)
 
 
-def room_token(key: bytes) -> str:
-    return pf.b64url_encode(_hkdf(key, INFO_ROOM))
+def room_token(key: bytes, *, space: Space = GUEST) -> str:
+    return pf.b64url_encode(_hkdf(key, space.info_room))
+
+
+def media_name_key(key: bytes, *, space: Space = GUEST) -> bytes:
+    if space.info_media_name is None:
+        raise GuestFormatError("This kind of room has no media")
+    return _hkdf(key, space.info_media_name)
+
+
+def check_sha(sha: str) -> str:
+    if not isinstance(sha, str) or not _SHA_RE.match(sha):
+        raise GuestFormatError("A media sha is 64 lowercase hex characters")
+    return sha
+
+
+def media_name(key: bytes, sha: str, *, space: Space = GUEST) -> str:
+    """The name a room stores the blob of plaintext `sha` under (64 hex characters)."""
+    import hmac
+
+    name_key = media_name_key(key, space=space)
+    return hmac.new(name_key, check_sha(sha).encode("ascii"), "sha256").hexdigest()
 
 
 # ---- sealing -------------------------------------------------------------------------
 
 
-def _kind(kind: int) -> Kind:
+def _kind(kind: int, space: Space = GUEST) -> IntEnum:
     try:
-        return Kind(kind)
+        return space.kinds(kind)
     except ValueError as e:
         raise GuestFormatError(f"Unknown frame kind {kind!r}") from e
 
 
-def block_for(kind: int) -> int:
-    return SNAPSHOT_BLOCK if _kind(kind) is Kind.SNAPSHOT else BLOCK
+def block_for(kind: int, *, space: Space = GUEST) -> int:
+    return space.blocks.get(_kind(kind, space), BLOCK)
 
 
-def aad(room: str, kind: int) -> bytes:
-    return f"{AAD_PREFIX}|{check_room(room)}|{int(_kind(kind))}".encode()
+def aad(room: str, kind: int, sha: str | None = None, *, space: Space = GUEST) -> bytes:
+    """`sha` (the plaintext's SHA-256, hex) is required for MEDIA and refused for other kinds."""
+    k = _kind(kind, space)
+    base = f"{space.aad_prefix}|{check_room(room)}|{int(k)}"
+    if space.media_kind is not None and k == space.media_kind:
+        if sha is None:
+            raise GuestFormatError("A media frame needs its sha")
+        return f"{base}|{check_sha(sha)}".encode()
+    if sha is not None:
+        raise GuestFormatError("Only a media frame has a sha")
+    return base.encode()
 
 
-def seal(key: bytes, room: str, kind: int, plaintext: bytes, nonce: bytes | None = None) -> bytes:
+def seal(
+    key: bytes,
+    room: str,
+    kind: int,
+    plaintext: bytes,
+    nonce: bytes | None = None,
+    sha: str | None = None,
+    *,
+    space: Space = GUEST,
+) -> bytes:
     """Pad and encrypt into an envelope. `nonce` is for the test vectors only."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    k = _kind(kind)
-    additional = aad(room, k)
+    k = _kind(kind, space)
+    additional = aad(room, k, sha, space=space)
     try:
-        padded = pf.pad(bytes(plaintext), block_for(k))
+        padded = pf.pad(bytes(plaintext), block_for(k, space=space))
     except pf.PublicationFormatError as e:
         raise GuestFormatError(str(e)) from e
     if nonce is None:
         nonce = secrets.token_bytes(NONCE_SIZE)
     elif len(nonce) != NONCE_SIZE:
         raise GuestFormatError("A nonce is 12 bytes")
-    sealed = AESGCM(frames_key(key)).encrypt(nonce, padded, additional)
+    sealed = AESGCM(frames_key(key, space=space)).encrypt(nonce, padded, additional)
     return bytes([k]) + nonce + sealed
 
 
-def unseal(key: bytes, room: str, envelope: bytes) -> tuple[Kind, bytes]:
+def unseal(
+    key: bytes, room: str, envelope: bytes, sha: str | None = None, *, space: Space = GUEST
+) -> tuple[IntEnum, bytes]:
     """Decrypt and unpad. Raises GuestFormatError for a wrong key or room, a changed kind
-    byte, a short or altered envelope, or bad padding."""
+    byte, a short or altered envelope, or bad padding. A MEDIA envelope opens only with its
+    `sha` (use `unseal_media`, which also checks the bytes against it)."""
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     check_room(room)
     if len(envelope) < 1 + NONCE_SIZE + TAG_SIZE:
         raise GuestFormatError("The data is too short to be a guest frame")
-    kind = _kind(envelope[0])
+    kind = _kind(envelope[0], space)
     nonce = envelope[1 : 1 + NONCE_SIZE]
     try:
-        padded = AESGCM(frames_key(key)).decrypt(nonce, envelope[1 + NONCE_SIZE :], aad(room, kind))
+        padded = AESGCM(frames_key(key, space=space)).decrypt(
+            nonce, envelope[1 + NONCE_SIZE :], aad(room, kind, sha, space=space)
+        )
     except InvalidTag as e:
         raise GuestFormatError(
             "Could not decrypt the frame: wrong key or room, or it was altered"
         ) from e
     try:
-        return kind, pf.unpad(padded, block_for(kind))
+        return kind, pf.unpad(padded, block_for(kind, space=space))
     except pf.PublicationFormatError as e:
         raise GuestFormatError(str(e)) from e
 
@@ -252,17 +347,57 @@ def canonical_json(obj: object) -> bytes:
         raise GuestFormatError("That value cannot be written as JSON") from e
 
 
-def seal_json(key: bytes, room: str, kind: int, obj: object, nonce: bytes | None = None) -> bytes:
-    if _kind(kind) not in JSON_KINDS:
+def seal_json(
+    key: bytes,
+    room: str,
+    kind: int,
+    obj: object,
+    nonce: bytes | None = None,
+    *,
+    space: Space = GUEST,
+) -> bytes:
+    if _kind(kind, space) not in space.json_kinds:
         raise GuestFormatError("That frame kind does not carry JSON")
-    return seal(key, room, kind, canonical_json(obj), nonce)
+    return seal(key, room, kind, canonical_json(obj), nonce, space=space)
 
 
-def unseal_json(key: bytes, room: str, envelope: bytes) -> tuple[Kind, object]:
-    kind, plain = unseal(key, room, envelope)
-    if kind not in JSON_KINDS:
+def unseal_json(
+    key: bytes, room: str, envelope: bytes, *, space: Space = GUEST
+) -> tuple[IntEnum, object]:
+    kind, plain = unseal(key, room, envelope, space=space)
+    if kind not in space.json_kinds:
         raise GuestFormatError("That frame kind does not carry JSON")
     try:
         return kind, json.loads(plain.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
         raise GuestFormatError("The frame is not valid JSON") from e
+
+
+# ---- media frames --------------------------------------------------------------------
+
+
+def seal_media(key: bytes, room: str, sha: str, data: bytes, nonce: bytes | None = None) -> bytes:
+    """Seal an image's bytes under the sha they must hash to (checked here too)."""
+    import hashlib
+
+    data = bytes(data)
+    if len(data) > MEDIA_MAX:
+        raise GuestFormatError(f"A media blob is at most {MEDIA_MAX} bytes")
+    if hashlib.sha256(data).hexdigest() != check_sha(sha):
+        raise GuestFormatError("The media bytes do not match their sha")
+    return seal(key, room, Kind.MEDIA, data, nonce, sha)
+
+
+def unseal_media(key: bytes, room: str, sha: str, envelope: bytes) -> bytes:
+    """The bytes of the blob sealed under `sha`; refuses any other kind, a wrong sha, and
+    plaintext that does not hash to `sha`."""
+    import hashlib
+
+    if len(envelope) > 0 and envelope[0] != Kind.MEDIA:
+        raise GuestFormatError("That is not a media frame")
+    _, data = unseal(key, room, envelope, check_sha(sha))
+    if len(data) > MEDIA_MAX:
+        raise GuestFormatError(f"A media blob is at most {MEDIA_MAX} bytes")
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise GuestFormatError("The media bytes do not match their sha")
+    return data

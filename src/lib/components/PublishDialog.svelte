@@ -22,7 +22,7 @@
 	import type { PublicationSelection, QuoteSpan } from '$lib/types/index.js';
 	import PartPicker from './PartPicker.svelte';
 	import Meeting from '../../../viewer/src/Meeting.svelte';
-	import type { Manifest } from '../../../viewer/src/format';
+	import type { ImageRef, Manifest } from '../../../viewer/src/format';
 
 	// Publish a meeting (backend services/publishing.py): the choices on the left, the viewer's
 	// own rendering of the result on the right, refreshed as they change.
@@ -80,6 +80,17 @@
 	/** The preview renders clips from the list on the left, which plays this backend's audio. */
 	async function previewClip(): Promise<Uint8Array> {
 		throw new Error('Listen to it under Quotes, on the left');
+	}
+
+	/** The preview's pictures come from this backend's notes, fetched with the connection's headers. */
+	function previewImage(image: ImageRef): Promise<string> {
+		return pub.imageUrl(image.id);
+	}
+
+	function sizeLabel(bytes: number): string {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 	}
 
 	async function primary() {
@@ -159,6 +170,36 @@
 						sel={sel as unknown as Record<string, boolean>}
 						onchange={(key, value) => pub.set({ [key]: value })}
 					/>
+
+					{#if sel.notes && pub.notesImages.length}
+						<section aria-label="Images in the notes">
+							<h4 class={groupHeading}>Images in the notes</h4>
+							<ul class="space-y-1.5">
+								{#each pub.notesImages as image (image.sha256)}
+									<li>
+										<label class="flex items-center gap-2 text-gray-300">
+											<input
+												type="checkbox"
+												class={check}
+												checked={pub.imageIncluded(image.sha256)}
+												onchange={(e) => pub.setImage(image.sha256, e.currentTarget.checked)}
+											/>
+											{#await pub.imageUrl(image.sha256)}
+												<span class="h-10 w-10 shrink-0 rounded bg-gray-800" aria-hidden="true"></span>
+											{:then url}
+												<img src={url} alt="" class="h-10 w-10 shrink-0 rounded bg-gray-800 object-cover" />
+											{:catch}
+												<span class="h-10 w-10 shrink-0 rounded bg-gray-800" aria-hidden="true"></span>
+											{/await}
+											<span class="min-w-0 flex-1 truncate text-xs {image.caption ? '' : 'text-gray-500'}">{image.caption || 'No caption'}</span>
+											<span class="shrink-0 text-xs text-gray-500">{sizeLabel(image.size)}</span>
+										</label>
+									</li>
+								{/each}
+							</ul>
+							<p class="mt-1.5 text-xs text-gray-500">A left-out image shows as its caption in brackets.</p>
+						</section>
+					{/if}
 
 					<section aria-label="Quotes">
 						<h4 class={groupHeading}>Quotes</h4>
@@ -262,6 +303,33 @@
 								<p class="mt-1 text-xs text-gray-500">Without a password, anyone with the file can read it.</p>
 							{/if}
 						{/if}
+						{#if pub.target === 'host'}
+							<div class="mt-2 space-y-2">
+								<div>
+									<label class="flex items-center gap-2 text-gray-300">
+										<input type="checkbox" class={check} checked={sel.follow} onchange={(e) => pub.set({ follow: e.currentTarget.checked })} />
+										Keep the link up to date
+									</label>
+									<p class="ml-6 mt-0.5 text-xs text-gray-500">Publishes a new version by itself when the meeting changes, with these same choices; nothing you did not tick is added.</p>
+								</div>
+								<div>
+									<label class="flex items-center gap-2 text-gray-300">
+										<input type="checkbox" class={check} checked={sel.comments} onchange={(e) => pub.set({ comments: e.currentTarget.checked })} />
+										Readers may comment
+									</label>
+									<p class="ml-6 mt-0.5 text-xs text-gray-500">Anyone with the link can comment under a name they type; their comments appear here marked (reader).</p>
+									{#if sel.comments}
+										<label class="ml-6 mt-2 flex items-center gap-2 text-gray-300">
+											<input type="checkbox" class={check} checked={sel.moderate} onchange={(e) => pub.set({ moderate: e.currentTarget.checked })} />
+											Approve comments before other readers see them
+										</label>
+										<p class="ml-12 mt-0.5 text-xs text-gray-500">Readers see a comment once you approve it here; its writer sees it at once, marked waiting.</p>
+									{/if}
+								</div>
+							</div>
+						{:else if pub.target === 'local'}
+							<p class="mt-1.5 text-xs text-gray-500">Live updates and comments need a publish host.</p>
+						{/if}
 					</section>
 
 					<div class="grid grid-cols-2 gap-3">
@@ -292,7 +360,7 @@
 					</p>
 					<div class="max-h-[70vh] overflow-y-auto rounded-lg border border-gray-800 bg-gray-950 p-4">
 						{#if manifest}
-							<Meeting {manifest} loadClip={previewClip} preview />
+							<Meeting {manifest} loadClip={previewClip} loadImage={previewImage} preview />
 						{:else if !pub.previewError}
 							<p class="text-sm text-gray-500">Loading the preview…</p>
 						{/if}
@@ -308,9 +376,10 @@
 						{#if pub.justPublished}
 							{expiresLine}
 						{:else}
-							Published {shortDate(current.created_at)} · version {current.version}{current.expires_at ? ` · expires ${shortDate(current.expires_at)}` : ''}{#if current.behind}<span class="text-amber-300">{' · behind'}</span>{/if}
+							Published {shortDate(current.created_at)} · version {current.version}{current.expires_at ? ` · expires ${shortDate(current.expires_at)}` : ''}{#if current.behind && !(current.selection.follow && !current.live_reason)}<span class="text-amber-300">{' · behind'}</span>{/if}{#if current.live === 'live'}<span class="text-emerald-300">{' · live'}</span>{#if current.readers > 0}{` · ${current.readers} reading`}{/if}{:else if current.live === 'offline'}<span class="text-amber-300">{' · not connected to the host'}</span>{:else if current.live === 'unsupported'}<span class="text-gray-500">{' · this host cannot push updates; readers check every minute'}</span>{/if}
 						{/if}
 					</p>
+					{#if current.live_reason}<p class="text-xs text-amber-300">{current.live_reason}</p>{/if}
 					<div class="flex gap-2">
 						<input readonly value={current.url} aria-label="Link" onfocus={(e) => e.currentTarget.select()} class="{inputClass} font-mono text-xs" />
 						<button onclick={() => copyText(current.url ?? '', 'Link copied')} class="shrink-0 rounded border border-gray-700 bg-gray-800 px-3 text-xs text-gray-200 hover:bg-gray-700">Copy</button>

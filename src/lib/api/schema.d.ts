@@ -1840,6 +1840,40 @@ export interface paths {
         patch: operations["edit_comment_api_sessions__session_id__comments__comment_id__patch"];
         trace?: never;
     };
+    "/api/sessions/{session_id}/comments/{comment_id}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Approve Comment */
+        post: operations["approve_comment_api_sessions__session_id__comments__comment_id__approve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/comments/{comment_id}/hide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Hide Comment */
+        post: operations["hide_comment_api_sessions__session_id__comments__comment_id__hide_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/sessions/{session_id}/comments/{comment_id}/reopen": {
         parameters: {
             query?: never;
@@ -2335,6 +2369,34 @@ export interface paths {
          *     not take the tick.
          */
         patch: operations["update_notes_item_api_sessions__session_id__notes_items__item_id__patch"];
+        trace?: never;
+    };
+    "/api/sessions/{session_id}/notes/media/{sha}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Media
+         * @description An image of the meeting's notes, for anyone who may read the meeting. 404 when its bytes
+         *     are not here (yet: they may still be uploading or travelling).
+         */
+        get: operations["get_media_api_sessions__session_id__notes_media__sha__get"];
+        /**
+         * Put Media
+         * @description Store an image of the meeting's notes: the raw WebP or JPEG bytes (Content-Type
+         *     image/webp or image/jpeg, matching them), `sha` their SHA-256. Who may: as for the notes
+         *     (an editor). 201 when stored, 200 when it was here; 400 a wrong hash, 413 over 2 MB or the
+         *     meeting's 50 MB, 415 another type.
+         */
+        put: operations["put_media_api_sessions__session_id__notes_media__sha__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/sessions/{session_id}/peer-shares": {
@@ -3011,6 +3073,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/share/media/{session_id}/{sha}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Media
+         * @description An image of a shared meeting's notes (raw WebP or JPEG bytes), for a contact whose live
+         *     share of that meeting includes the notes and whose notes show that image. 404 for anything
+         *     else, whether or not the meeting or the image exists.
+         */
+        get: operations["media_api_share_media__session_id___sha__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/share/poke": {
         parameters: {
             query?: never;
@@ -3222,6 +3306,28 @@ export interface paths {
          * @description Who this computer is and which sync it speaks; a peer asks first in every round.
          */
         get: operations["hello_api_sync_hello_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sync/media/{session_id}/{sha256}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Media
+         * @description The bytes of an image of a meeting's notes (the document only carries its row), for the
+         *     computer that synced the meeting. Decrypted here; the caller seals them when it encrypts.
+         *     404 when the bytes are not here.
+         */
+        get: operations["get_media_api_sync_media__session_id___sha256__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4553,6 +4659,8 @@ export interface components {
             anchor: {
                 [key: string]: unknown;
             };
+            /** Approved At */
+            approved_at: string | null;
             /** At Seconds */
             at_seconds: number | null;
             /**
@@ -4575,6 +4683,11 @@ export interface components {
              * @default false
              */
             can_edit: boolean;
+            /**
+             * Can Moderate
+             * @default false
+             */
+            can_moderate: boolean;
             /**
              * Can Resolve
              * @default false
@@ -4600,6 +4713,8 @@ export interface components {
              * @default false
              */
             detached: boolean;
+            /** Hidden At */
+            hidden_at: string | null;
             /** Id */
             id: string;
             /** Mentions */
@@ -4854,6 +4969,24 @@ export interface components {
              */
             reason: string;
         };
+        /**
+         * CopilotAdded
+         * @description One line the copilot added to the meeting's notes (services/copilot_notes.py). Its
+         *     line in the document has the ref `cp:<n>`.
+         */
+        CopilotAdded: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "summary" | "decision" | "action" | "question";
+            /** N */
+            n: number;
+            /** Owner */
+            owner: string | null;
+            /** Text */
+            text: string;
+        };
         /** CopilotAskRequest */
         CopilotAskRequest: {
             /** Question */
@@ -4873,6 +5006,8 @@ export interface components {
         CopilotNotes: {
             /** Action Items */
             action_items: components["schemas"]["CopilotItem"][];
+            /** Added */
+            added: components["schemas"]["CopilotAdded"][];
             /** Agenda Covered */
             agenda_covered: number[];
             /** Decisions */
@@ -5825,6 +5960,22 @@ export interface components {
             text: string;
         };
         /**
+         * NotesImage
+         * @description An image of the meeting's notes, for the Publish dialog's list.
+         */
+        NotesImage: {
+            /** Caption */
+            caption: string;
+            /** Height */
+            height: number;
+            /** Sha256 */
+            sha256: string;
+            /** Size */
+            size: number;
+            /** Width */
+            width: number;
+        };
+        /**
          * NotesItem
          * @description An action item typed in the meeting's live notes (phase 11): a task line with a person
          *     chip (services/notes_items.py). `text`, `owner`, `at` and `done` are derived from the line
@@ -6296,12 +6447,28 @@ export interface components {
             /** Id */
             id: string;
             /**
+             * Live
+             * @default off
+             * @enum {string}
+             */
+            live: "live" | "offline" | "unsupported" | "off";
+            /**
+             * Live Reason
+             * @default
+             */
+            live_reason: string;
+            /**
              * Local Reach
              * @enum {string}
              */
             local_reach: "team" | "phone_url" | "this_device";
             /** Published By */
             published_by: string;
+            /**
+             * Readers
+             * @default 0
+             */
+            readers: number;
             selection: components["schemas"]["PublicationSelection-Output"];
             /** Served By */
             served_by: string | null;
@@ -6343,6 +6510,11 @@ export interface components {
              */
             chapters: boolean;
             /**
+             * Comments
+             * @default false
+             */
+            comments: boolean;
+            /**
              * Decisions
              * @default true
              */
@@ -6353,6 +6525,11 @@ export interface components {
              */
             expires_days: number | null;
             /**
+             * Follow
+             * @default false
+             */
+            follow: boolean;
+            /**
              * Hide Identifiers
              * @default true
              */
@@ -6361,6 +6538,8 @@ export interface components {
             host_is_ours: boolean;
             /** Host Url */
             host_url: string;
+            /** Images */
+            images: string[] | null;
             /**
              * Local Reach
              * @enum {string}
@@ -6368,6 +6547,13 @@ export interface components {
             local_reach: "team" | "phone_url" | "this_device";
             /** Local Url */
             local_url: string;
+            /**
+             * Moderate
+             * @default false
+             */
+            moderate: boolean;
+            /** Moderated Since */
+            moderated_since: string | null;
             /**
              * Names
              * @default as_is
@@ -6379,6 +6565,8 @@ export interface components {
              * @default false
              */
             notes: boolean;
+            /** Notes Images */
+            notes_images: components["schemas"]["NotesImage"][];
             /**
              * Questions
              * @default true
@@ -6438,6 +6626,11 @@ export interface components {
              */
             chapters: boolean;
             /**
+             * Comments
+             * @default false
+             */
+            comments: boolean;
+            /**
              * Decisions
              * @default true
              */
@@ -6448,10 +6641,24 @@ export interface components {
              */
             expires_days: number | null;
             /**
+             * Follow
+             * @default false
+             */
+            follow: boolean;
+            /**
              * Hide Identifiers
              * @default true
              */
             hide_identifiers: boolean;
+            /** Images */
+            images?: string[] | null;
+            /**
+             * Moderate
+             * @default false
+             */
+            moderate: boolean;
+            /** Moderated Since */
+            moderated_since?: string | null;
             /**
              * Names
              * @default as_is
@@ -6510,6 +6717,11 @@ export interface components {
              */
             chapters: boolean;
             /**
+             * Comments
+             * @default false
+             */
+            comments: boolean;
+            /**
              * Decisions
              * @default true
              */
@@ -6520,10 +6732,24 @@ export interface components {
              */
             expires_days: number | null;
             /**
+             * Follow
+             * @default false
+             */
+            follow: boolean;
+            /**
              * Hide Identifiers
              * @default true
              */
             hide_identifiers: boolean;
+            /** Images */
+            images: string[] | null;
+            /**
+             * Moderate
+             * @default false
+             */
+            moderate: boolean;
+            /** Moderated Since */
+            moderated_since: string | null;
             /**
              * Names
              * @default as_is
@@ -6984,6 +7210,8 @@ export interface components {
              * @default
              */
             origin: string;
+            /** Own Notes */
+            own_notes: string | null;
             /**
              * Owner Id
              * @default
@@ -7141,6 +7369,8 @@ export interface components {
             created_at: string;
             /** Has Transcript */
             has_transcript: boolean;
+            /** Media Bytes */
+            media_bytes: number;
             /** Name */
             name: string;
             /** Session Id */
@@ -7216,6 +7446,8 @@ export interface components {
             copilot?: boolean | null;
             /** Copilot Interval Seconds */
             copilot_interval_seconds?: number | null;
+            /** Copilot To Notes */
+            copilot_to_notes?: boolean | null;
             /** Default Model */
             default_model?: string | null;
             /** Default Provider */
@@ -7422,6 +7654,8 @@ export interface components {
             speaker_match_threshold?: number | null;
             /** Summary Chunk Chars */
             summary_chunk_chars?: number | null;
+            /** Summary In Notes */
+            summary_in_notes?: boolean | null;
             /** Summary Instructions */
             summary_instructions?: string | null;
             /** Summary Style */
@@ -7515,6 +7749,8 @@ export interface components {
             copilot: boolean;
             /** Copilot Interval Seconds */
             copilot_interval_seconds: number;
+            /** Copilot To Notes */
+            copilot_to_notes: boolean;
             /** Data Dir */
             data_dir: string;
             /** Default Model */
@@ -7733,6 +7969,8 @@ export interface components {
             speaker_match_threshold: number;
             /** Summary Chunk Chars */
             summary_chunk_chars: number;
+            /** Summary In Notes */
+            summary_in_notes: boolean;
             /** Summary Instructions */
             summary_instructions: string;
             /** Summary Style */
@@ -7987,6 +8225,28 @@ export interface components {
             /** Ticks */
             ticks: number;
         };
+        /**
+         * SharedMedia
+         * @description An image the shared notes show (docs/plans/2026-11-04-images-tasks.md, task 11a). Only a
+         *     description: the bytes come from `GET /api/share/media/<meeting id>/<sha256>`, which checks
+         *     the share again. Filled only when the share includes the notes, and only for images the
+         *     notes document references and whose bytes the owner has.
+         */
+        SharedMedia: {
+            /**
+             * Ext
+             * @enum {string}
+             */
+            ext: "webp" | "jpeg";
+            /** Height */
+            height: number;
+            /** Sha256 */
+            sha256: string;
+            /** Size */
+            size: number;
+            /** Width */
+            width: number;
+        };
         /** SharedMeeting */
         SharedMeeting: {
             /** Attendees */
@@ -8010,6 +8270,8 @@ export interface components {
             format: number;
             /** Id */
             id: string;
+            /** Media */
+            media: components["schemas"]["SharedMedia"][];
             /** Name */
             name: string;
             /**
@@ -8206,12 +8468,23 @@ export interface components {
             database_bytes: number;
             /** Largest */
             largest: components["schemas"]["SessionUsage"][];
+            /** Notes Media Bytes */
+            notes_media_bytes: number;
             /** Recordings Bytes */
             recordings_bytes: number;
             /** Retention Days */
             retention_days: number;
             /** Sessions With Audio */
             sessions_with_audio: number;
+        };
+        /** StoredMedia */
+        StoredMedia: {
+            /** Ext */
+            ext: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size */
+            size: number;
         };
         /** SuggestRequest */
         SuggestRequest: {
@@ -8442,6 +8715,8 @@ export interface components {
             anchor: {
                 [key: string]: unknown;
             };
+            /** Approved At */
+            approved_at: string | null;
             /**
              * Author
              * @default
@@ -8459,6 +8734,8 @@ export interface components {
              * @default false
              */
             deleted: boolean;
+            /** Hidden At */
+            hidden_at: string | null;
             /** Id */
             id: string;
             /** Mentions */
@@ -8567,6 +8844,37 @@ export interface components {
             schema_version: number;
             /** Seq */
             seq: number;
+        };
+        /**
+         * SyncMedia
+         * @description An image of the meeting's notes as its row says (`notes_media`): which blob it is, never
+         *     its bytes (they come from `GET /api/sync/media/{session_id}/{sha256}`). `created_at` stays
+         *     the stored ISO text; `last_seen_at` is each machine's own and does not travel.
+         */
+        SyncMedia: {
+            /**
+             * By
+             * @default
+             */
+            by: string;
+            /** Created At */
+            created_at: string;
+            /** Ext */
+            ext: string;
+            /**
+             * Height
+             * @default 0
+             */
+            height: number;
+            /** Sha256 */
+            sha256: string;
+            /** Size */
+            size: number;
+            /**
+             * Width
+             * @default 0
+             */
+            width: number;
         };
         /** SyncNowResponse */
         SyncNowResponse: {
@@ -8758,6 +9066,11 @@ export interface components {
          *     publication, as the SENDER sees it (its own sync id when it is its own).
          */
         SyncPublication: {
+            /**
+             * Box Key
+             * @default
+             */
+            box_key: string;
             /** Clip Blobs */
             clip_blobs: {
                 [key: string]: {
@@ -8793,6 +9106,11 @@ export interface components {
              */
             published_digest: string;
             selection: components["schemas"]["PublicationSelection-Output"];
+            /**
+             * Sign Key
+             * @default
+             */
+            sign_key: string;
             /** Token */
             token: string;
             /** Unpublished At */
@@ -8858,6 +9176,8 @@ export interface components {
              * @default false
              */
             local_only: boolean;
+            /** Media */
+            media: components["schemas"]["SyncMedia"][] | null;
             /**
              * Meeting Type
              * @default
@@ -12866,6 +13186,70 @@ export interface operations {
             };
         };
     };
+    approve_comment_api_sessions__session_id__comments__comment_id__approve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                comment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Comment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    hide_comment_api_sessions__session_id__comments__comment_id__hide_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                comment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Comment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     reopen_comment_api_sessions__session_id__comments__comment_id__reopen_post: {
         parameters: {
             query?: never;
@@ -13840,6 +14224,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TaskItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_media_api_sessions__session_id__notes_media__sha__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                sha: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                    "image/webp": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_media_api_sessions__session_id__notes_media__sha__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                sha: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description It was stored already */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMedia"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoredMedia"];
                 };
             };
             /** @description Validation Error */
@@ -15112,6 +15570,39 @@ export interface operations {
             };
         };
     };
+    media_api_share_media__session_id___sha__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                sha: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                    "image/webp": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     poke_api_share_poke_post: {
         parameters: {
             query?: {
@@ -15408,6 +15899,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SyncHello"];
+                };
+            };
+        };
+    };
+    get_media_api_sync_media__session_id___sha256__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+                sha256: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

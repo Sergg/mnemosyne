@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import shared_notes
+from . import notes_media, shared_notes
 from .shared_notes import NotesDocError
 
 if TYPE_CHECKING:
@@ -48,6 +48,9 @@ class Union:
     plain: str | None = None  # its plain text and comment ranges (shared_notes.marks_of)
     comments: dict | None = None
     tasks: list | None = None  # its task lines (the sidecar's `tasks`), None when not reported
+    media: list | None = None  # its image values (the sidecar's `media`), None when not reported
+    refs: list | None = None  # its line refs (shared_notes.refs_of), None when not reported
+    reply: dict | None = None  # the sidecar's whole answer, for shared_notes.AFTER_FOLD
 
 
 def author(peer_name: str) -> str:
@@ -82,7 +85,7 @@ def union(ctx: AppContext, session_id: str, theirs: str) -> Union:
     except (KeyError, TypeError, ValueError) as e:
         raise NotesDocError(f"unreadable merge reply: {e}") from e
     plain, comments = shared_notes.marks_of(reply)
-    tasks = reply.get("tasks")
+    tasks, media = reply.get("tasks"), reply.get("media")
     return Union(
         merged,
         markdown,
@@ -91,6 +94,9 @@ def union(ctx: AppContext, session_id: str, theirs: str) -> Union:
         plain=plain,
         comments=comments,
         tasks=tasks if isinstance(tasks, list) else None,
+        media=media if isinstance(media, list) else None,
+        refs=shared_notes.refs_of(reply),
+        reply=reply,
     )
 
 
@@ -103,11 +109,20 @@ def _derive_items(ctx: AppContext, session_id: str, tasks: list | None) -> None:
     notes_items.apply(ctx, session_id, tasks, log=False)
 
 
+def _after_fold(ctx: AppContext, session_id: str, reply: dict | None, peer_name: str) -> None:
+    """shared_notes.AFTER_FOLD for a document that came by sync (no request frames; the
+    author is the peer's sync name). Nothing without a sidecar answer. Never raises."""
+    if reply is not None:
+        shared_notes._after_fold(ctx, session_id, reply, [], author(peer_name))
+
+
 def store_union(ctx: AppContext, session_id: str, u: Union, peer_name: str) -> None:
     """Store a union (no new version of the meeting: the caller's write of the rest counts it)
     and send the editors connected here what the merge brought."""
     if not u.changed:
         _derive_items(ctx, session_id, u.tasks)  # the same document: only repairs
+        notes_media.seen(ctx, session_id, u.media)
+        _after_fold(ctx, session_id, u.reply, peer_name)
         return
     seqs = ctx.repo.store_synced_notes_doc(
         session_id,
@@ -118,8 +133,11 @@ def store_union(ctx: AppContext, session_id: str, u: Union, peer_name: str) -> N
         notes=u.markdown,
         plain=u.plain,
         comments=u.comments,
+        refs=u.refs,
     )
     _derive_items(ctx, session_id, u.tasks)
+    notes_media.seen(ctx, session_id, u.media)
+    _after_fold(ctx, session_id, u.reply, peer_name)
     if seqs:
         shared_notes._on_loop(
             ctx,
@@ -147,6 +165,9 @@ def adopt(ctx: AppContext, session_id: str, theirs: str, peer_name: str) -> bool
     plain: str | None = None
     comments: dict | None = None
     tasks: list | None = None
+    media: list | None = None
+    refs: list | None = None
+    reply: dict | None = None
     binary = shared_notes._binary()
     if binary is not None:
         try:
@@ -162,6 +183,8 @@ def adopt(ctx: AppContext, session_id: str, theirs: str, peer_name: str) -> bool
             markdown = str(reply["markdown"])
             plain, comments = shared_notes.marks_of(reply)
             tasks = reply.get("tasks") if isinstance(reply.get("tasks"), list) else None
+            media = reply.get("media") if isinstance(reply.get("media"), list) else None
+            refs = shared_notes.refs_of(reply)
         except (NotesDocError, KeyError) as e:
             logger.warning("Sync: the notes document of %s cannot be read: %s", session_id, e)
             return False
@@ -171,9 +194,18 @@ def adopt(ctx: AppContext, session_id: str, theirs: str, peer_name: str) -> bool
     # Frames typed here and never folded (no sidecar then) stay in the log, unfolded: the next
     # fold applies them on top of the adopted document.
     repo.store_synced_notes_doc(
-        session_id, snapshot, markdown, [], author(peer_name), plain=plain, comments=comments
+        session_id,
+        snapshot,
+        markdown,
+        [],
+        author(peer_name),
+        plain=plain,
+        comments=comments,
+        refs=refs,
     )
     _derive_items(ctx, session_id, tasks)
+    notes_media.seen(ctx, session_id, media)
+    _after_fold(ctx, session_id, reply, peer_name)
     shared_notes._on_loop(ctx, reload_room, ctx, session_id)
     return True
 

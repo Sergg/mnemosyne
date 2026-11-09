@@ -39,7 +39,13 @@ from ..models.session import (
 )
 from ..models.shared_meeting import SharedMeeting
 from ..models.speaker import SpeakerProfile
-from ..models.sync_session import SyncPeerShare, SyncSession, event_travels, peer_share_rank
+from ..models.sync_session import (
+    SyncMedia,
+    SyncPeerShare,
+    SyncSession,
+    event_travels,
+    peer_share_rank,
+)
 from ..models.transcript import TranscriptSegment
 
 logger = logging.getLogger(__name__)
@@ -244,7 +250,9 @@ CREATE TABLE IF NOT EXISTS comments (
     updated_at TEXT NOT NULL,
     resolved_at TEXT,
     resolved_by TEXT NOT NULL DEFAULT '',
-    deleted INTEGER NOT NULL DEFAULT 0
+    deleted INTEGER NOT NULL DEFAULT 0,
+    approved_at TEXT,
+    hidden_at TEXT
 );
 CREATE INDEX IF NOT EXISTS comments_session ON comments(session_id);
 {COMMENT_FTS}
@@ -332,7 +340,9 @@ CREATE TABLE IF NOT EXISTS shared_notes_ops (
 -- folded (Session.notes differing from it = written around the document, which catches up),
 -- its plain text and each comment mark's range in it as last folded (`comment_ranges`, JSON
 -- {comment id: [start, end) | null}, code points; services/comments.py places notes comments
--- from them), and the last edit shown.
+-- from them), its line refs as last folded (`refs`, JSON: the sidecar's `refs` list, each
+-- {line, ref, index, md_line} with md_line a line of `markdown`; services/notes_sections.py),
+-- and the last edit shown.
 CREATE TABLE IF NOT EXISTS shared_notes (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
     snapshot BLOB,
@@ -342,7 +352,24 @@ CREATE TABLE IF NOT EXISTS shared_notes (
     last_at TEXT,
     markdown TEXT,
     plain TEXT,
-    comment_ranges TEXT
+    comment_ranges TEXT,
+    refs TEXT
+);
+-- Images in the notes (services/notes_media.py): one row per stored blob of a meeting, the
+-- file under <data_dir>/notes_media/<session_id>/<sha256>.<ext>[.enc]. `last_seen_at` is when
+-- the document last referenced it (a fold's `media`, or the upload); unseen for 7 days = swept.
+-- `by` is who uploaded it (a user id, "" on the desktop, "guest", a contact).
+CREATE TABLE IF NOT EXISTS notes_media (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    sha256 TEXT NOT NULL,
+    ext TEXT NOT NULL,
+    width INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    by TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, sha256)
 );
 CREATE TABLE IF NOT EXISTS session_assets (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -443,7 +470,9 @@ CREATE TABLE IF NOT EXISTS deletions (
 -- published_digest is a hash of what the last version showed (`behind`). One live (not
 -- unpublished) row per meeting. A change here is a new version of the meeting for library sync
 -- (the row travels in SyncSession.publications); `origin` is the computer whose files serve a
--- "local" publication ('' = this one, else its sync id).
+-- "local" publication ('' = this one, else its sync id). sign_key and box_key are the raw private
+-- owner keys of a live publication (NULL until `follow` or `comments` is first on): they travel
+-- with the row in library sync like key and token, and nowhere else.
 CREATE TABLE IF NOT EXISTS publications (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -460,7 +489,9 @@ CREATE TABLE IF NOT EXISTS publications (
     clip_blobs TEXT NOT NULL DEFAULT '{}',
     published_digest TEXT NOT NULL DEFAULT '',
     published_by TEXT NOT NULL DEFAULT '',
-    origin TEXT NOT NULL DEFAULT ''
+    origin TEXT NOT NULL DEFAULT '',
+    sign_key BLOB,
+    box_key BLOB
 );
 CREATE INDEX IF NOT EXISTS publications_session ON publications(session_id);
 CREATE UNIQUE INDEX IF NOT EXISTS publications_live ON publications(session_id)
@@ -593,11 +624,17 @@ def _ranges_json(comments: dict | None) -> str | None:
     return None if comments is None else json.dumps(comments, sort_keys=True)
 
 
+def _refs_json(refs: list | None) -> str | None:
+    """A fold's line refs (the sidecar's `refs` list) as stored; None = not known."""
+    return None if refs is None else json.dumps(refs)
+
+
 def _dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
 _TERM = re.compile(r"[\w']+", re.UNICODE)
+_MEDIA_SHA = re.compile(r"^[0-9a-f]{64}$")
 
 
 # Words that carry no retrieval signal in questions about meetings.
@@ -709,6 +746,10 @@ class SessionRepository:
         self._lock = threading.RLock()
         # Called with (session id, owner id) after a new meeting is saved (services/prefs.py).
         self.on_new_session: Callable[[str, str], None] | None = None
+        # Called with a meeting's id after every write of its `summary` or `summary_data`, the
+        # transaction committed (`_after_summary`; api/context.py: the notes' Summary section
+        # follows, services/notes_summary.py). From any thread; it must not block.
+        self.after_summary: Callable[[str], None] | None = None
         # This machine's id in version vectors (services/sync sets it at startup). '' until
         # then: writes still bump the change counter and count under the key "" in sync_vv.
         self.device_id = ""
@@ -842,7 +883,7 @@ class SessionRepository:
         }:
             self._conn.execute("ALTER TABLE shared_notes ADD COLUMN markdown TEXT")
         notes_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(shared_notes)")}
-        for col in ("plain", "comment_ranges"):
+        for col in ("plain", "comment_ranges", "refs"):
             if col not in notes_cols:
                 self._conn.execute(f"ALTER TABLE shared_notes ADD COLUMN {col} TEXT")
         # A meeting someone shared WITH this person: the sharer's person key (64 hex); '' for
@@ -873,6 +914,14 @@ class SessionRepository:
             self._conn.execute(
                 "ALTER TABLE publications ADD COLUMN origin TEXT NOT NULL DEFAULT ''"
             )
+        for col in ("sign_key", "box_key"):
+            if col not in pub_cols:
+                self._conn.execute(f"ALTER TABLE publications ADD COLUMN {col} BLOB")
+        # Moderation of readers' comments on a live publication (task 13b).
+        comment_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(comments)")}
+        for col in ("approved_at", "hidden_at"):
+            if col not in comment_cols:
+                self._conn.execute(f"ALTER TABLE comments ADD COLUMN {col} TEXT")
         self._conn.commit()
 
     def _migrate_fts_rowids(self) -> None:
@@ -1142,6 +1191,12 @@ class SessionRepository:
             for r in rows
         ]
 
+    def _own_notes(self, session_id: str, notes: str | None) -> str:
+        """The notes above the backend's sections (services/notes_sections.py)."""
+        from ..services.notes_sections import own_notes
+
+        return own_notes(self, session_id, notes or "")
+
     def get(self, session_id: str) -> Session | None:
         """The meeting, or None when there is none or the caller may not see it."""
         only = access.read_owner()
@@ -1187,6 +1242,7 @@ class SessionRepository:
                 else None
             ),
             notes=row["notes"],
+            own_notes=self._own_notes(session_id, row["notes"]),
             participants=json.loads(row["participants"]),
             attendees=json.loads(row["attendees"]),
             local_only=bool(row["local_only"]),
@@ -1262,7 +1318,16 @@ class SessionRepository:
         owner = self._owner(session.id)
         session.owner_id = owner if owner is not None else (session.owner_id or access.user_id())
         session.updated_at = datetime.now()
+        data_json = session.summary_data.model_dump_json() if session.summary_data else None
         with self._lock, self._conn:
+            was = self._conn.execute(
+                "SELECT summary, summary_data FROM sessions WHERE id=?", (session.id,)
+            ).fetchone()
+            summary_changed = (
+                (session.summary or "", data_json) != ((was["summary"] or ""), was["summary_data"])
+                if was is not None
+                else bool(session.summary or data_json)
+            )
             self._conn.execute(
                 """INSERT INTO sessions(id, name, status, created_at, updated_at, audio_file,
                                         summary, summary_data, notes, participants,
@@ -1287,7 +1352,7 @@ class SessionRepository:
                     session.updated_at.isoformat(),
                     session.audio_file,
                     session.summary,
-                    session.summary_data.model_dump_json() if session.summary_data else None,
+                    data_json,
                     session.notes,
                     json.dumps(session.participants),
                     json.dumps(session.attendees),
@@ -1303,6 +1368,8 @@ class SessionRepository:
             self._write_segments(session.id, session.transcript)
             self._write_recordings(session.id, session.recordings)
             self._touch(session.id, session.updated_at.isoformat())
+        if summary_changed:
+            self._after_summary(session.id)
         if owner is None and self.on_new_session is not None:
             self.on_new_session(session.id, session.owner_id)
         return session
@@ -1363,6 +1430,8 @@ class SessionRepository:
             # A status is per machine and the audio file is local: neither travels.
             if set(fields) - LOCAL_FIELDS:
                 self._touch(session_id, now)
+        if {"summary", "summary_data"} & set(fields):
+            self._after_summary(session_id)
         return self.get(session_id)
 
     def replace_segments(self, session_id: str, segments: list[TranscriptSegment]) -> None:
@@ -1668,6 +1737,8 @@ class SessionRepository:
             resolved_at=_dt(r["resolved_at"]) if r["resolved_at"] else None,
             resolved_by=r["resolved_by"],
             deleted=bool(r["deleted"]),
+            approved_at=_dt(r["approved_at"]) if r["approved_at"] else None,
+            hidden_at=_dt(r["hidden_at"]) if r["hidden_at"] else None,
         )
 
     def _comment_session(self, comment_id: str) -> str | None:
@@ -1809,6 +1880,30 @@ class SessionRepository:
                 (
                     None if resolved_at is None else resolved_at.isoformat(),
                     "" if resolved_at is None else resolved_by,
+                    comment_id,
+                ),
+            )
+            if cur.rowcount:
+                self._touch(session_id)
+        return cur.rowcount > 0
+
+    def set_comment_moderation(
+        self,
+        comment_id: str,
+        approved_at: datetime | None,
+        hidden_at: datetime | None,
+    ) -> bool:
+        """Set when a comment was approved and when it was hidden for readers of a published link
+        (None clears one). False when it is gone."""
+        session_id = self._comment_session(comment_id)
+        if session_id is None:
+            return False
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE comments SET approved_at=?, hidden_at=? WHERE id=?",
+                (
+                    None if approved_at is None else approved_at.isoformat(),
+                    None if hidden_at is None else hidden_at.isoformat(),
                     comment_id,
                 ),
             )
@@ -2030,13 +2125,15 @@ class SessionRepository:
     _PUB_COLS = (
         "id, session_id, key, token, place, host_url, version, selection, created_at,"
         " updated_at, expires_at, unpublished_at, clip_blobs, published_digest, published_by,"
-        " origin"
+        " origin, sign_key, box_key"
     )
 
     @staticmethod
     def _publication(r: sqlite3.Row) -> dict:
         row = dict(r)
         row["key"] = bytes(row["key"])
+        for col in ("sign_key", "box_key"):  # the owner keys: bytes, or None before live
+            row[col] = bytes(row[col]) if row[col] else None
         row["selection"] = json.loads(row["selection"])
         row["clip_blobs"] = json.loads(row["clip_blobs"] or "{}")
         return row
@@ -2094,10 +2191,12 @@ class SessionRepository:
             row.get("published_digest", ""),
             row.get("published_by", ""),
             row.get("origin", ""),
+            row.get("sign_key"),
+            row.get("box_key"),
         )
 
     _PUB_UPSERT = (
-        f"INSERT INTO publications ({_PUB_COLS}) VALUES ({','.join('?' * 16)})"
+        f"INSERT INTO publications ({_PUB_COLS}) VALUES ({','.join('?' * 18)})"
         " ON CONFLICT(id) DO UPDATE SET "
         + ", ".join(
             f"{c.strip()}=excluded.{c.strip()}"
@@ -2222,6 +2321,8 @@ class SessionRepository:
                 "published_digest": p.published_digest,
                 "published_by": p.published_by,
                 "origin": "" if p.origin == self.device_id else p.origin,
+                "sign_key": base64.b64decode(p.sign_key) if p.sign_key else None,
+                "box_key": base64.b64decode(p.box_key) if p.box_key else None,
             }
             self._conn.execute(self._PUB_UPSERT, self._publication_values(row))
 
@@ -2343,11 +2444,14 @@ class SessionRepository:
         markdown: str | None,
         plain: str | None = None,
         comments: dict | None = None,
+        *,
+        refs: list | None = None,
     ) -> None:
         """The snapshot now holds every frame up to `upto_seq` and renders as `markdown` (None:
         not known, e.g. a snapshot merged in by sync before its fold; no catching up then).
         `plain` and `comments` are the fold's plain text and each comment mark's range in it
-        (the sidecar's answer; None = not known, then notes comments show as detached).
+        (the sidecar's answer; None = not known, then notes comments show as detached). `refs`
+        are its line refs (shared_notes.refs_of; None = not known, `notes_refs` gives None).
 
         A snapshot that differs from the stored one (the document's first, or formatting, comment
         marks and artifacts that leave the markdown alone) is a new version of the meeting for
@@ -2360,11 +2464,21 @@ class SessionRepository:
             ).fetchone()
             self._conn.execute(
                 "INSERT INTO shared_notes (session_id, snapshot, folded_seq, updated_at, markdown,"
-                " plain, comment_ranges) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE"
-                " SET snapshot=excluded.snapshot, folded_seq=excluded.folded_seq,"
+                " plain, comment_ranges, refs) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id)"
+                " DO UPDATE SET snapshot=excluded.snapshot, folded_seq=excluded.folded_seq,"
                 " updated_at=excluded.updated_at, markdown=excluded.markdown,"
-                " plain=excluded.plain, comment_ranges=excluded.comment_ranges",
-                (session_id, snapshot, upto_seq, now, markdown, plain, _ranges_json(comments)),
+                " plain=excluded.plain, comment_ranges=excluded.comment_ranges,"
+                " refs=excluded.refs",
+                (
+                    session_id,
+                    snapshot,
+                    upto_seq,
+                    now,
+                    markdown,
+                    plain,
+                    _ranges_json(comments),
+                    _refs_json(refs),
+                ),
             )
             self._conn.execute(
                 "UPDATE shared_notes_ops SET folded=1 WHERE session_id=? AND seq<=? AND folded=0",
@@ -2390,12 +2504,13 @@ class SessionRepository:
         notes: str | None = None,
         plain: str | None = None,
         comments: dict | None = None,
+        refs: list | None = None,
     ) -> list[int]:
         """A notes document that came by library sync (services/sync_notes.py), one transaction:
         `frames` (what the local snapshot lacked of it, for the connected editors) are appended
         to the log as `author`, already folded; `snapshot` (the union, or the peer's document
         adopted where there was none) becomes the stored one with its `markdown`; `notes`, when
-        given, becomes `Session.notes` in the same breath; `plain` and `comments` as in
+        given, becomes `Session.notes` in the same breath; `plain`, `comments` and `refs` as in
         `store_notes_fold`. No new version (`_touch`): the sync
         apply path counts it. Frames that arrived from editors meanwhile (unfolded, so not in
         `snapshot`) stay unfolded. Returns the appended frames' sequence numbers."""
@@ -2413,10 +2528,10 @@ class SessionRepository:
             )
             self._conn.execute(
                 "INSERT INTO shared_notes (session_id, snapshot, folded_seq, updated_at, markdown,"
-                " plain, comment_ranges) VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE"
-                " SET snapshot=excluded.snapshot, updated_at=excluded.updated_at,"
+                " plain, comment_ranges, refs) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id)"
+                " DO UPDATE SET snapshot=excluded.snapshot, updated_at=excluded.updated_at,"
                 " markdown=excluded.markdown, plain=excluded.plain,"
-                " comment_ranges=excluded.comment_ranges,"
+                " comment_ranges=excluded.comment_ranges, refs=excluded.refs,"
                 " folded_seq=MAX(folded_seq, excluded.folded_seq)",
                 (
                     session_id,
@@ -2426,6 +2541,7 @@ class SessionRepository:
                     markdown,
                     plain,
                     _ranges_json(comments),
+                    _refs_json(refs),
                 ),
             )
             if notes is not None:
@@ -2448,10 +2564,32 @@ class SessionRepository:
             return None
         return row["plain"], ranges if isinstance(ranges, dict) else {}
 
-    def set_notes_markdown(self, session_id: str, markdown: str) -> None:
+    def notes_refs(self, session_id: str, markdown: str | None = None) -> list[dict] | None:
+        """The line refs of the document as last folded (the sidecar's `refs` list: {line, ref,
+        index, md_line}, md_line a line of that fold's markdown); None when none were stored
+        (no document, or a sidecar that did not report them). With `markdown`: None too when
+        the stored markdown is not that text (the notes were written around the document, so
+        the md_lines do not describe it)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT markdown, refs FROM shared_notes WHERE session_id=?", (session_id,)
+            ).fetchone()
+        if row is None or row["refs"] is None:
+            return None
+        if markdown is not None and row["markdown"] != markdown:
+            return None
+        try:
+            refs = json.loads(row["refs"])
+        except ValueError:
+            return None
+        return refs if isinstance(refs, list) else None
+
+    def set_notes_markdown(self, session_id: str, markdown: str, refs: list | None = None) -> None:
+        """The document's markdown as last folded, and its line refs (None: not known)."""
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE shared_notes SET markdown=? WHERE session_id=?", (markdown, session_id)
+                "UPDATE shared_notes SET markdown=?, refs=? WHERE session_id=?",
+                (markdown, _refs_json(refs), session_id),
             )
 
     def notes_drift(self, session_id: str) -> str | None:
@@ -2478,6 +2616,93 @@ class SessionRepository:
             ).fetchall()
         by_seq = {r["seq"]: r["author"] or "" for r in rows}
         return [by_seq.get(s, "") for s in seqs]
+
+    # ---- images in the notes (services/notes_media.py; no access checks: the caller checks) --
+
+    def put_media_row(
+        self,
+        session_id: str,
+        sha256: str,
+        ext: str,
+        width: int,
+        height: int,
+        size: int,
+        by: str = "",
+        at: str | None = None,
+    ) -> bool:
+        """A blob stored for the meeting: a new version of the meeting (`_touch`) when the row is
+        new; the file of a row that had none (it came with library sync, whose version already
+        counts it) changes nothing but the row. False for an unknown meeting."""
+        at = at or datetime.now().isoformat()
+        with self._lock, self._conn:
+            if self._conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                known = self._conn.execute(
+                    "SELECT 1 FROM notes_media WHERE session_id=? AND sha256=?",
+                    (session_id, sha256),
+                ).fetchone()
+                self._conn.execute(
+                    "INSERT INTO notes_media (session_id, sha256, ext, width, height, size,"
+                    " created_at, last_seen_at, by) VALUES (?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(session_id, sha256) DO UPDATE SET ext=excluded.ext,"
+                    " width=excluded.width, height=excluded.height, size=excluded.size,"
+                    " last_seen_at=excluded.last_seen_at",
+                    (session_id, sha256, ext, width, height, size, at, at, by),
+                )
+                if known is None:
+                    self._touch(session_id)
+                return True
+        return False
+
+    def media_rows(self, session_id: str) -> list[dict]:
+        """The meeting's blobs, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM notes_media WHERE session_id=? ORDER BY created_at, sha256",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_media(self, session_id: str, shas: list[str], at: str) -> int:
+        """The document references these blobs (a fold's `media`): `last_seen_at` = `at`. No new
+        version: each machine sees its own. Returns the rows changed."""
+        if not shas:
+            return 0
+        with self._lock, self._conn:
+            cur = self._conn.executemany(
+                "UPDATE notes_media SET last_seen_at=? WHERE session_id=? AND sha256=?"
+                " AND last_seen_at < ?",
+                [(at, session_id, sha, at) for sha in dict.fromkeys(shas)],
+            )
+        return cur.rowcount
+
+    def stale_media(self, before: str) -> list[dict]:
+        """Rows of every meeting not seen since `before` (an ISO time), for the sweep."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM notes_media WHERE last_seen_at < ? ORDER BY session_id, sha256",
+                (before,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_media_rows(self, session_id: str, shas: list[str]) -> int:
+        """Forget blobs (the sweep): no new version, like `touch_media`."""
+        if not shas:
+            return 0
+        with self._lock, self._conn:
+            cur = self._conn.executemany(
+                "DELETE FROM notes_media WHERE session_id=? AND sha256=?",
+                [(session_id, sha) for sha in dict.fromkeys(shas)],
+            )
+        return cur.rowcount
+
+    def media_total(self, session_id: str) -> int:
+        """The bytes of the meeting's stored blobs (for the per-meeting cap)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(size), 0) AS total FROM notes_media WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        return int(row["total"])
 
     # ---- action items from the notes (services/notes_items.py; internal, no access checks) --
 
@@ -2907,6 +3132,7 @@ class SessionRepository:
                 (data.model_dump_json(), datetime.now().isoformat(), session_id),
             )
             self._touch(session_id)
+        self._after_summary(session_id)
         return True
 
     # By item id (ActionItem.id) rather than list position, for writes that reach several
@@ -2960,21 +3186,23 @@ class SessionRepository:
             ).fetchone()
             if row is None:
                 return False
+            item = None
             if row["summary_data"]:
                 data = SummaryData.model_validate_json(row["summary_data"])
                 item = next((a for a in data.action_items if a.id == item_id), None)
-                if item is not None:
-                    if all(getattr(item, k) == v for k, v in fields.items()):
-                        return True  # already so: no new version
-                    for k, v in fields.items():
-                        setattr(item, k, v)
-                    self._conn.execute(
-                        "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
-                        (data.model_dump_json(), datetime.now().isoformat(), session_id),
-                    )
-                    self._touch(session_id)
-                    return True
-            return self._write_notes_item_locked(session_id, item_id, fields)
+            if item is None:
+                return self._write_notes_item_locked(session_id, item_id, fields)
+            if all(getattr(item, k) == v for k, v in fields.items()):
+                return True  # already so: no new version
+            for k, v in fields.items():
+                setattr(item, k, v)
+            self._conn.execute(
+                "UPDATE sessions SET summary_data=?, updated_at=? WHERE id=?",
+                (data.model_dump_json(), datetime.now().isoformat(), session_id),
+            )
+            self._touch(session_id)
+        self._after_summary(session_id)
+        return True
 
     _NOTES_ITEM_FIELDS = frozenset({"done", "follow", "due", "task_id", "issue_url"})
 
@@ -3043,6 +3271,7 @@ class SessionRepository:
                 (data.model_dump_json(), datetime.now().isoformat(), session_id),
             )
             self._touch(session_id)
+        self._after_summary(session_id)
         return True
 
     def adopt_unowned(self, owner_id: str) -> int:
@@ -3366,6 +3595,7 @@ class SessionRepository:
                     now,
                 ),
             )
+        self._after_summary(sid)
         if row is None:
             return "new"
         if held is None or json.loads(held["parts"] or "{}") != parts:
@@ -4216,19 +4446,22 @@ class SessionRepository:
                 "UPDATE sessions SET participants=?, updated_at=? WHERE id=?",
                 (json.dumps(participants), datetime.now().isoformat(), session_id),
             )
-            self._rename_item_owners(session_id, old, new)
+            owners_changed = self._rename_item_owners(session_id, old, new)
             self._touch(session_id)
+        if owners_changed:
+            self._after_summary(session_id)
         return self.get(session_id)
 
-    def _rename_item_owners(self, session_id: str, old: str, new: str) -> None:
-        """Action items owned by the speaker label `old` now belong to `new`."""
+    def _rename_item_owners(self, session_id: str, old: str, new: str) -> bool:
+        """Action items owned by the speaker label `old` now belong to `new`. True when any
+        did."""
         from ..services.tasks import rename_owner
 
         row = self._conn.execute(
             "SELECT summary_data FROM sessions WHERE id=?", (session_id,)
         ).fetchone()
         if row is None or not row["summary_data"]:
-            return
+            return False
         data = SummaryData.model_validate_json(row["summary_data"])
         changed = False
         for item in data.action_items:
@@ -4240,6 +4473,7 @@ class SessionRepository:
                 "UPDATE sessions SET summary_data=? WHERE id=?",
                 (data.model_dump_json(), session_id),
             )
+        return changed
 
     def list_speakers(self) -> list[SpeakerProfile]:
         with self._lock:
@@ -4341,6 +4575,19 @@ class SessionRepository:
             "UPDATE sessions SET sync_seq=?, sync_vv=?, updated_at=? WHERE id=?",
             (seq, json.dumps(vv, sort_keys=True), at or datetime.now().isoformat(), session_id),
         )
+
+    def _after_summary(self, session_id: str) -> None:
+        """A meeting's `summary` or `summary_data` was written: tell `after_summary`. Called by
+        every statement that writes them, after its transaction (C9 of
+        docs/plans/2026-11-04-summaries-in-notes.md: ticks never pass update_fields). Never
+        raises."""
+        hook = self.after_summary
+        if hook is None:
+            return
+        try:
+            hook(session_id)
+        except Exception:
+            logger.warning("The summary hook failed for %s", session_id, exc_info=True)
 
     def _touch_all(self, moves: list[tuple[str, int, str, int]]) -> None:
         """Every meeting a move names, source and target, once."""
@@ -4597,7 +4844,8 @@ class SessionRepository:
             self._conn.executemany(
                 "INSERT OR REPLACE INTO comments (id, session_id, parent_id, target, target_id,"
                 " anchor, quote, text, author_id, author, mentions, created_at, updated_at,"
-                " resolved_at, resolved_by, deleted) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " resolved_at, resolved_by, deleted, approved_at, hidden_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         c.id,
@@ -4616,6 +4864,8 @@ class SessionRepository:
                         c.resolved_at,
                         c.resolved_by,
                         int(c.deleted),
+                        c.approved_at,
+                        c.hidden_at,
                     )
                     for c in s.comments
                 ],
@@ -4628,6 +4878,7 @@ class SessionRepository:
             self._link_synced_assets(sid, s)
             self.store_synced_publications(sid, s.publications)
             self._store_synced_peer_shares(sid, s.peer_shares)
+            self._store_synced_media(sid, s.media)
             have = {
                 r["uid"]
                 for r in self._conn.execute(
@@ -4647,6 +4898,7 @@ class SessionRepository:
                 self._touch(sid)
             else:
                 self._advance_seq(sid)
+        self._after_summary(sid)
         return sid
 
     def _store_synced_peer_shares(self, session_id: str, shares: list[SyncPeerShare]) -> None:
@@ -4676,6 +4928,32 @@ class SessionRepository:
                     p.at,
                     p.updated_at,
                     p.revoked_at,
+                ),
+            )
+
+    def _store_synced_media(self, session_id: str, media: list[SyncMedia] | None) -> None:
+        """Library sync's write of a meeting's image rows: the ones we lack are added without
+        their bytes (they are fetched afterwards, services/sync_service.py), `last_seen_at` now
+        so the sweep does not take them before the document is looked at; a row we have stays as
+        it is and none is removed, so an older peer that sends no `media` (None) wipes nothing.
+        No new version: the arrival is the sender's version. Inside the caller's transaction."""
+        now = datetime.now().isoformat()
+        for m in media or []:
+            if not _MEDIA_SHA.match(m.sha256) or m.ext not in ("webp", "jpeg") or m.size < 0:
+                continue
+            self._conn.execute(
+                "INSERT OR IGNORE INTO notes_media (session_id, sha256, ext, width, height, size,"
+                " created_at, last_seen_at, by) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    session_id,
+                    m.sha256,
+                    m.ext,
+                    max(0, m.width),
+                    max(0, m.height),
+                    m.size,
+                    m.created_at or now,
+                    now,
+                    m.by,
                 ),
             )
 

@@ -67,6 +67,8 @@ class SyncComment(ApiModel):
     resolved_at: str | None = None
     resolved_by: str = ""
     deleted: bool = False
+    approved_at: str | None = None  # moderation for readers of a published link
+    hidden_at: str | None = None
 
 
 class SyncAsset(ApiModel):
@@ -96,6 +98,20 @@ class SyncEvent(ApiModel):
     detail: dict = Field(default_factory=dict)
 
 
+class SyncMedia(ApiModel):
+    """An image of the meeting's notes as its row says (`notes_media`): which blob it is, never
+    its bytes (they come from `GET /api/sync/media/{session_id}/{sha256}`). `created_at` stays
+    the stored ISO text; `last_seen_at` is each machine's own and does not travel."""
+
+    sha256: str
+    ext: str  # "webp" | "jpeg"
+    width: int = 0
+    height: int = 0
+    size: int
+    created_at: str
+    by: str = ""
+
+
 class SyncPublication(ApiModel):
     """A publication row as stored (services/publishing.py), key and token included: library
     sync is between one person's own computers, which must be able to update a link. Times stay
@@ -117,6 +133,8 @@ class SyncPublication(ApiModel):
     published_digest: str = ""
     published_by: str = ""
     origin: str = ""
+    sign_key: str = ""
+    box_key: str = ""
 
 
 def _when(text: str) -> datetime:
@@ -146,8 +164,11 @@ def merge_publications(
         if mine is None:
             by_id[p.id] = p
             continue
-        win = p if _rank(p) > _rank(mine) else mine
-        by_id[p.id] = win.model_copy(update={"version": max(mine.version, p.version)})
+        win, lose = (p, mine) if _rank(p) > _rank(mine) else (mine, p)
+        update: dict = {"version": max(mine.version, p.version)}
+        if not win.sign_key and lose.sign_key:  # keys made once never go missing in a merge
+            update.update(sign_key=lose.sign_key, box_key=lose.box_key)
+        by_id[p.id] = win.model_copy(update=update)
     live = [p for p in by_id.values() if not p.unpublished_at]
     if len(live) > 1:
         keep = max(live, key=lambda p: (_rank(p), p.id))
@@ -236,6 +257,10 @@ class SyncSession(ApiModel):
     # Who the meeting is shared with (phase 8): merged by person, newer `updated_at` wins
     # (`merge_peer_shares`). Absent from older peers, which must not wipe ours.
     peer_shares: list[SyncPeerShare] = Field(default_factory=list)
+    # The images of the notes (rows only): None = the sender does not know the field (an older
+    # peer): ours are kept. Merged as a union by sha256 (services/sync_merge.py); none is ever
+    # removed by a merge (each machine sweeps its own unused ones).
+    media: list[SyncMedia] | None = None
     speaker_embeddings: dict[str, list[float]] = Field(default_factory=dict)
     assets: list[SyncAsset] = Field(default_factory=list)
     events: list[SyncEvent] = Field(default_factory=list)

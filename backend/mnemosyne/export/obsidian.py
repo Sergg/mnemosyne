@@ -52,6 +52,7 @@ class ObsidianExporter:
         annex: Mapping[str, list[str]] | None = None,
         continued: Mapping[str, str] | None = None,
         meeting_note: Callable[[str], tuple[str, str] | None] | None = None,
+        image_file: Callable[[str, str], str | None] | None = None,
     ):
         self.vault_path = Path(vault_path)
         self.subfolder = subfolder
@@ -72,6 +73,9 @@ class ObsidianExporter:
         # Meeting id -> (note file name without .md, title) of a meeting already in the vault:
         # the notes' meeting chips link to it (None: they are just the title).
         self.meeting_note = meeting_note
+        # (sha, ext) -> the file name in attachments/ of an image of the notes that the export
+        # wrote there (api/routes/export.py `_images`); None: images are `[image: caption]`.
+        self.image_file = image_file
 
     def render(self, session: Session, resources: list[str] | None = None) -> str:
         transcript = session.transcript
@@ -94,7 +98,9 @@ class ObsidianExporter:
             participants=session.participants,
             transcript_segments=[seg.model_dump() for seg in transcript],
             summary=session.summary,
-            notes=session.notes,
+            # Without the backend's sections (the summary is rendered from summary_data);
+            # a session not read by repo.get has none worked out: its notes as they are.
+            notes=session.notes if session.own_notes is None else session.own_notes,
             summary_data=session.summary_data,
             tags=self.tags,
             link_people=self.link_people,
@@ -111,6 +117,7 @@ class ObsidianExporter:
             continued=self.continued,
             meeting_note=self.meeting_note,
             notes_items=session.notes_items,
+            image_file=self.image_file,
         )
         if self.redact:  # the summary, notes, action items and the rest
             from ..summarization.privacy import redact_identifiers
